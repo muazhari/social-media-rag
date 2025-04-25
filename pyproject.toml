@@ -1,0 +1,11 @@
+[project]
+name = "social-media-rag"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic",
+    "streamlit",
+    "matrix-nio[e2e]",
+    "graphlit-client",
+]

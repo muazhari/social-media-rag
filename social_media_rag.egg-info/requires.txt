@@ -1,0 +1,4 @@
+pydantic
+streamlit
+matrix-nio[e2e]
+graphlit-client
