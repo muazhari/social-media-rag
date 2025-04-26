@@ -6,35 +6,15 @@ from pathlib import Path
 
 import streamlit as st
 from graphlit import Graphlit
-from nio import AsyncClient, RoomMessageText, RoomMessageMedia, SyncError, LoginError, RoomMessagesError, \
-    AsyncClientConfig, MegolmEvent
+from graphlit_api import ContentFilter, ConversationInput, SpecificationInput, GoogleModels, ModelServiceTypes, \
+    GoogleModelPropertiesInput, EntityReferenceInput, ConversationStrategyInput
+from nio import AsyncClient, RoomMessageText, RoomMessageMedia, SyncError, RoomMessagesError, \
+    AsyncClientConfig, MegolmEvent, EncryptionError
 
 
-# --- Async Matrix fetcher -----------------------------------
-async def retrieve_messages(user, token, device_id, room_id):
-    store_dir = Path("./encryption_keys")
-    store_dir.mkdir(exist_ok=True)
-
-    client = AsyncClient(
-        homeserver="https://matrix.beeper.com",
-        user=user,
-        device_id=device_id,
-        store_path=str(store_dir),
-        config=AsyncClientConfig(
-            store_sync_tokens=True,
-            encryption_enabled=True,
-        )
-    )
-    client.restore_login(
-        user_id=user,
-        device_id=device_id,
-        access_token=token,
-    )
-
-    sync_response = await client.sync(timeout=30000)
-    if isinstance(sync_response, SyncError):
-        raise Exception(f"Sync failed: {sync_response}")
-    room_messages_response = await client.room_messages(room_id, limit=100)
+async def retrieve_messages(room_id):
+    matrix_client = await make_matrix_client()
+    room_messages_response = await matrix_client.room_messages(room_id, limit=100)
     if isinstance(room_messages_response, RoomMessagesError):
         raise Exception(f"Room messages fetch failed: {room_messages_response}")
     messages = []
@@ -47,113 +27,148 @@ async def retrieve_messages(user, token, device_id, room_id):
                 "timestamp": event.server_timestamp,
             })
         elif isinstance(event, RoomMessageMedia):
-            uri = await client.mxc_to_http(event.url)
+            uri = await matrix_client.mxc_to_http(event.url)
             messages.append({
                 "type": "media",
                 "uri": uri,
+                "mxc": event.url,
                 "sender": event.sender,
                 "timestamp": event.server_timestamp,
             })
         elif isinstance(event, MegolmEvent):
-            decrypted = client.decrypt_event(event)
-            if decrypted.decrypted:
-                print(decrypted)
-            else:
-                raise Exception(f"Unsupported message type: {type(decrypted)}")
-    await client.close()
+            try:
+                decrypted_event = matrix_client.decrypt_event(event)
+                if decrypted_event.decrypted:
+                    print(decrypted_event)
+                else:
+                    raise Exception(f"Unable to decrypt message: {decrypted_event}")
+            except EncryptionError:
+                raise Exception(f"Encryption error: {event}")
+
+    await matrix_client.close()
     return messages
 
 
-# --- Graphlit helpers -------------------------------------
-def make_client():
-    return Graphlit(
+async def make_graphlit_client():
+    graphlit_client = Graphlit(
         organization_id=st.session_state["GRAPHLIT_ORGANIZATION_ID"],
         environment_id=st.session_state["GRAPHLIT_ENVIRONMENT_ID"],
         jwt_secret=st.session_state["GRAPHLIT_SECRET"],
-    ).client  # .client is the GraphQL client
+    ).client
+    return graphlit_client
 
 
-async def ingest_text(text: str):
-    # wrap text as bytes
-    data_byte = text.encode("utf-8")
+async def make_matrix_client():
+    store_dir = Path("./encryption_keys")
+    store_dir.mkdir(exist_ok=True)
+    matrix_client = AsyncClient(
+        homeserver="https://matrix.beeper.com",
+        store_path=str(store_dir),
+        config=AsyncClientConfig(
+            store_sync_tokens=True,
+            encryption_enabled=True,
+        )
+    )
+    matrix_client.restore_login(
+        user_id=st.session_state["MATRIX_USER"],
+        device_id=st.session_state["MATRIX_DEVICE_ID"],
+        access_token=st.session_state["MATRIX_TOKEN"],
+    )
+    sync_response = await matrix_client.sync(full_state=True, timeout=30000)
+    if isinstance(sync_response, SyncError):
+        raise Exception(f"Sync failed: {sync_response}")
+    return matrix_client
+
+
+async def ingest_text(message: dict):
+    graphlit_client = await make_graphlit_client()
+    data_byte = message["text"].encode("utf-8")
     data_b64 = base64.b64encode(data_byte).decode("utf-8")
     content_hash = hashlib.sha256(data_byte).hexdigest()
-    found_contents = await make_client().query_contents(
-        filter={
-            "name": content_hash,
-            "limit": 1,
-        }
+    found_contents = await graphlit_client.query_contents(
+        filter=ContentFilter(
+            name=content_hash,
+            limit=1,
+        )
     )
     if len(found_contents.contents.results) == 0:
-        return await make_client().ingest_encoded_file(
+        return graphlit_client.ingest_encoded_file(
             name=content_hash,
             data=data_b64,
             mime_type="text/plain",
             is_synchronous=True
         )
-    return found_contents[0]
+    return found_contents.contents.results[0]
 
 
-async def ingest_media(uri: str):
-    content_hash = hashlib.sha256(uri.encode("utf-8")).hexdigest()
-    found_contents = await make_client().query_contents(
-        filter={
-            "name": content_hash,
-            "limit": 1,
-        }
+async def ingest_media(message: dict):
+    graphlit_client = await make_graphlit_client()
+    content_hash = hashlib.sha256(message["mxc"].encode("utf-8")).hexdigest()
+    found_contents = await graphlit_client.query_contents(
+        filter=ContentFilter(
+            name=content_hash,
+            limit=1,
+        )
     )
     if len(found_contents.contents.results) == 0:
-        return await make_client().ingest_uri(
+        return await graphlit_client.ingest_uri(
             name=content_hash,
-            uri=uri,
+            uri=message["uri"],
             is_synchronous=True
         )
-    return found_contents[0]
+    return found_contents.contents.results[0]
 
 
 async def start_or_get_conversation():
-    # for simplicity, we store one conversation per session
+    graphlit_client = await make_graphlit_client()
+    # for simplicity, we store one conversation per session.
     if "conversation_id" not in st.session_state:
-        # Create a conversation object with minimal required fields
-        conversation = {"name": "Matrix Chat Session"}
-        create_conversation = await make_client().create_conversation(conversation)
+        create_conversation = await graphlit_client.create_conversation(
+            conversation=ConversationInput(
+                name="Matrix Chat Session",
+            )
+        )
         st.session_state["conversation_id"] = create_conversation.create_conversation.id
     return st.session_state["conversation_id"]
 
 
 async def ask_rag(query: str):
+    graphlit_client = await make_graphlit_client()
     conversation_id = await start_or_get_conversation()
     prompt = f"""
+        <instruction>
         Answer the following query using ONLY the citation that has been retrieved.
         If you cannot find the answer in the retrieved citation, you must respond with "I don't have enough information to answer that query."
         Do not make up any information other than from the retrieved citation.
-
-        Query: {query}
+        <instruction/>
+        <query>
+        {query}
+        <query/>
         """
-    create_specification_response = await make_client().create_specification(
-        specification={
-            "name": "Matrix Chat Specification",
-            "serviceType": "OPEN_AI",
-            "openAI": {
-                "model": "GPT4O_128K"
-            },
-            "strategy": {
-                "embedCitations": True,
-            }
-        }
+    create_specification_response = await graphlit_client.create_specification(
+        specification=SpecificationInput(
+            name="Matrix Chat Specification",
+            serviceType=ModelServiceTypes.GOOGLE,
+            google=GoogleModelPropertiesInput(
+                model=GoogleModels.GEMINI_2_5_PRO_PREVIEW
+            ),
+            strategy=ConversationStrategyInput(
+                embedCitations=True,
+            )
+        )
     )
-    prompt_conversation_response = await make_client().prompt_conversation(
+    prompt_conversation_response = await graphlit_client.prompt_conversation(
         prompt=prompt,
         id=conversation_id,
-        specification={
-            "id": create_specification_response.create_specification.id,
-        }
+        specification=EntityReferenceInput(
+            id=create_specification_response.create_specification.id
+        )
     )
     return prompt_conversation_response.prompt_conversation.message
 
 
 # --- Streamlit UI -----------------------------------------
-st.title("Matrix → Graphlit RAG")
+st.title("social-media-rag")
 
 st.sidebar.header("Credentials")
 st.sidebar.text_input("Graphlit Organization ID", key="GRAPHLIT_ORGANIZATION_ID",
@@ -177,19 +192,17 @@ if st.sidebar.button("Sync from Matrix"):
         with st.spinner("Fetching messages…"):
             messages = asyncio.run(
                 retrieve_messages(
-                    user=st.session_state["MATRIX_USER"],
-                    token=st.session_state["MATRIX_TOKEN"],
-                    device_id=st.session_state["MATRIX_DEVICE_ID"],
                     room_id=st.session_state["MATRIX_ROOM_ID"]
                 )
             )
-            for message in messages:
-                if message["type"] == "text":
-                    asyncio.run(ingest_text(message["text"]))
-                elif message["type"] == "media":
-                    asyncio.run(ingest_media(message["uri"]))
-                else:
-                    raise Exception(f"Unknown message type: {message['type']}")
+            for index, message in enumerate(messages):
+                with st.spinner(f"Processing message {index + 1} of {len(messages)}"):
+                    if message["type"] == "text":
+                        asyncio.run(ingest_text(message))
+                    elif message["type"] == "media":
+                        asyncio.run(ingest_media(message))
+                    else:
+                        raise Exception(f"Unknown message type: {message['type']}")
         st.success("Synced to Graphlit!")
 
 query = st.text_area("Ask a query:")
@@ -205,6 +218,6 @@ if st.button("Submit"):
                 if citation.content.mime_type.startswith("text/"):
                     st.markdown(citation.text)
                 elif citation.content.mime_type.startswith("image/"):
-                    st.image(citation.content.text_uri)
+                    st.image(citation.content.uri)
                 else:
                     raise Exception(f"Unknown content type: {citation.content.mime_type}")
