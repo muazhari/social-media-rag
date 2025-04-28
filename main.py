@@ -1,52 +1,19 @@
 import asyncio
 import base64
 import hashlib
+import io
 import os
+import sys
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
 from graphlit import Graphlit
 from graphlit_api import ContentFilter, ConversationInput, SpecificationInput, GoogleModels, ModelServiceTypes, \
-    GoogleModelPropertiesInput, EntityReferenceInput, ConversationStrategyInput
+    GoogleModelPropertiesInput, EntityReferenceInput, ConversationStrategyInput, RetrievalStrategyInput, \
+    RetrievalStrategyTypes
 from nio import AsyncClient, RoomMessageText, RoomMessageMedia, SyncError, RoomMessagesError, \
-    AsyncClientConfig, MegolmEvent, EncryptionError
-
-
-async def retrieve_messages(room_id):
-    matrix_client = await make_matrix_client()
-    room_messages_response = await matrix_client.room_messages(room_id, limit=100)
-    if isinstance(room_messages_response, RoomMessagesError):
-        raise Exception(f"Room messages fetch failed: {room_messages_response}")
-    messages = []
-    for event in room_messages_response.chunk:
-        if isinstance(event, RoomMessageText):
-            messages.append({
-                "type": "text",
-                "text": event.body,
-                "sender": event.sender,
-                "timestamp": event.server_timestamp,
-            })
-        elif isinstance(event, RoomMessageMedia):
-            uri = await matrix_client.mxc_to_http(event.url)
-            messages.append({
-                "type": "media",
-                "uri": uri,
-                "mxc": event.url,
-                "sender": event.sender,
-                "timestamp": event.server_timestamp,
-            })
-        elif isinstance(event, MegolmEvent):
-            try:
-                decrypted_event = matrix_client.decrypt_event(event)
-                if decrypted_event.decrypted:
-                    print(decrypted_event)
-                else:
-                    raise Exception(f"Unable to decrypt message: {decrypted_event}")
-            except EncryptionError:
-                raise Exception(f"Encryption error: {event}")
-
-    await matrix_client.close()
-    return messages
+    AsyncClientConfig, RoomEncryptedMedia
 
 
 async def make_graphlit_client():
@@ -74,10 +41,69 @@ async def make_matrix_client():
         device_id=st.session_state["MATRIX_DEVICE_ID"],
         access_token=st.session_state["MATRIX_TOKEN"],
     )
+
+    keys_file_path = str(store_dir / "keys.txt")
+    current_keys_data = st.session_state["MATRIX_KEYS_FILE"].getvalue()
+    current_keys_hash = hashlib.sha256(current_keys_data).hexdigest()
+
+    last_keys_file = io.FileIO(keys_file_path)
+    last_keys_data = last_keys_file.read()
+    last_keys_hash = hashlib.sha256(last_keys_data).hexdigest()
+
+    if last_keys_hash != current_keys_hash:
+        with open(keys_file_path, "wb") as f:
+            f.write(current_keys_data)
+
+        await matrix_client.import_keys(
+            infile=keys_file_path,
+            passphrase=st.session_state["MATRIX_KEYS_PASSPHRASE"],
+        )
+
     sync_response = await matrix_client.sync(full_state=True, timeout=30000)
     if isinstance(sync_response, SyncError):
         raise Exception(f"Sync failed: {sync_response}")
+
     return matrix_client
+
+
+async def retrieve_messages(room_ids: [str]):
+    matrix_client = await make_matrix_client()
+    room_messages_responses = []
+    for room_id in room_ids:
+        room_messages_response = await matrix_client.room_messages(
+            room_id=room_id,
+            limit=sys.maxsize,
+        )
+        if isinstance(room_messages_response, RoomMessagesError):
+            raise Exception(f"Room messages fetch failed: {room_messages_response}")
+        room_messages_responses.append(room_messages_response)
+
+    messages = []
+    for room_messages_response in room_messages_responses:
+        for event in room_messages_response.chunk:
+            print(type(event))
+            print(event.__dict__)
+
+            if isinstance(event, RoomMessageText):
+                messages.append({
+                    "type": "text",
+                    "text": event.body,
+                    "sender": event.sender,
+                    "timestamp": event.server_timestamp,
+                })
+            elif isinstance(event, RoomMessageMedia):
+                uri = await matrix_client.mxc_to_http(event.url)
+                messages.append({
+                    "type": "media",
+                    "mxc": event.url,
+                    "uri": uri,
+                    "sender": event.sender,
+                    "timestamp": event.server_timestamp,
+                })
+            elif isinstance(event, RoomEncryptedMedia):
+                st.toast("Encrypted media message is not supported, skipping...")
+    await matrix_client.close()
+    return messages
 
 
 async def ingest_text(message: dict):
@@ -92,7 +118,7 @@ async def ingest_text(message: dict):
         )
     )
     if len(found_contents.contents.results) == 0:
-        return graphlit_client.ingest_encoded_file(
+        return await graphlit_client.ingest_encoded_file(
             name=content_hash,
             data=data_b64,
             mime_type="text/plain",
@@ -122,10 +148,11 @@ async def ingest_media(message: dict):
 async def start_or_get_conversation():
     graphlit_client = await make_graphlit_client()
     # for simplicity, we store one conversation per session.
+    # clear cache if the user wants to start a new conversation
     if "conversation_id" not in st.session_state:
         create_conversation = await graphlit_client.create_conversation(
             conversation=ConversationInput(
-                name="Matrix Chat Session",
+                name=f"social-media-rag-conversation-{datetime.now().isoformat()}",
             )
         )
         st.session_state["conversation_id"] = create_conversation.create_conversation.id
@@ -138,8 +165,8 @@ async def ask_rag(query: str):
     prompt = f"""
         <instruction>
         Answer the following query using ONLY the citation that has been retrieved.
-        If you cannot find the answer in the retrieved citation, you must respond with "I don't have enough information to answer that query."
-        Do not make up any information other than from the retrieved citation.
+        If you cannot find the answer in the retrieved citation, you must respond with "I don't have enough information to answer that query.".
+        Do not make up any information.
         <instruction/>
         <query>
         {query}
@@ -147,13 +174,17 @@ async def ask_rag(query: str):
         """
     create_specification_response = await graphlit_client.create_specification(
         specification=SpecificationInput(
-            name="Matrix Chat Specification",
+            name=f"social-media-rag-specification",
             serviceType=ModelServiceTypes.GOOGLE,
             google=GoogleModelPropertiesInput(
                 model=GoogleModels.GEMINI_2_5_PRO_PREVIEW
             ),
             strategy=ConversationStrategyInput(
                 embedCitations=True,
+            ),
+            retrievalStrategy=RetrievalStrategyInput(
+                type=RetrievalStrategyTypes.CHUNK,
+                contentLimit=st.session_state["GRAPHLIT_CITATION_LIMIT"],
             )
         )
     )
@@ -171,39 +202,107 @@ async def ask_rag(query: str):
 st.title("social-media-rag")
 
 st.sidebar.header("Credentials")
-st.sidebar.text_input("Graphlit Organization ID", key="GRAPHLIT_ORGANIZATION_ID",
-                      value=os.environ.get("GRAPHLIT_ORGANIZATION_ID"))
-st.sidebar.text_input("Graphlit Environment ID", key="GRAPHLIT_ENVIRONMENT_ID",
-                      value=os.environ.get("GRAPHLIT_ENVIRONMENT_ID"))
-st.sidebar.text_input("Graphlit Secret", key="GRAPHLIT_SECRET", type="password",
-                      value=os.environ.get("GRAPHLIT_SECRET"))
-st.sidebar.text_input("Matrix User", key="MATRIX_USER", value=os.environ.get("MATRIX_USER"))
-st.sidebar.text_input("Matrix Token", key="MATRIX_TOKEN", type="password",
-                      value=os.environ.get("MATRIX_TOKEN"))
-st.sidebar.text_input("Matrix Device ID", key="MATRIX_DEVICE_ID", value=os.environ.get("MATRIX_DEVICE_ID"))
-st.sidebar.text_input("Matrix Room ID", key="MATRIX_ROOM_ID", value=os.environ.get("MATRIX_ROOM_ID"))
+st.sidebar.text_input(
+    label="Graphlit Organization ID",
+    key="GRAPHLIT_ORGANIZATION_ID",
+    value=os.environ.get("GRAPHLIT_ORGANIZATION_ID"),
+)
+st.sidebar.text_input(
+    label="Graphlit Environment ID",
+    key="GRAPHLIT_ENVIRONMENT_ID",
+    value=os.environ.get("GRAPHLIT_ENVIRONMENT_ID")
+)
+st.sidebar.text_input(
+    label="Graphlit Secret",
+    key="GRAPHLIT_SECRET",
+    type="password",
+    value=os.environ.get("GRAPHLIT_SECRET")
+)
+st.sidebar.text_input(
+    label="Matrix User",
+    key="MATRIX_USER",
+    value=os.environ.get("MATRIX_USER")
+)
+st.sidebar.text_input(
+    label="Matrix Token",
+    key="MATRIX_TOKEN",
+    type="password",
+    value=os.environ.get("MATRIX_TOKEN")
+)
+st.sidebar.text_input(
+    label="Matrix Device ID",
+    key="MATRIX_DEVICE_ID",
+    value=os.environ.get("MATRIX_DEVICE_ID")
+)
+st.sidebar.file_uploader(
+    label="Matrix Keys File",
+    type="txt",
+    key="MATRIX_KEYS_FILE"
+)
+st.sidebar.text_input(
+    label="Matrix Keys Passphrase",
+    key="MATRIX_KEYS_PASSPHRASE",
+    value=os.environ.get("MATRIX_KEYS_PASSPHRASE"),
+    type="password"
+)
+st.sidebar.text_area(
+    label="Matrix Room ID(s)",
+    key="MATRIX_ROOM_ID",
+    value=os.environ.get("MATRIX_ROOM_ID"),
+    help="Enter one or more room IDs, separated by new lines."
+)
+st.sidebar.number_input(
+    label="Graphlit Citation Limit",
+    key="GRAPHLIT_CITATION_LIMIT",
+    value=100,
+    min_value=1,
+    help="The maximum number of citations can be retrieved."
+)
 
-if st.sidebar.button("Sync from Matrix"):
+if st.sidebar.button("Sync"):
     if not all(st.session_state[k] for k in (
-            "GRAPHLIT_ORGANIZATION_ID", "GRAPHLIT_ENVIRONMENT_ID", "GRAPHLIT_SECRET", "MATRIX_TOKEN",
-            "MATRIX_ROOM_ID")):
-        st.error("Fill in all credentials and Matrix details first.")
+            "GRAPHLIT_ORGANIZATION_ID",
+            "GRAPHLIT_ENVIRONMENT_ID",
+            "GRAPHLIT_SECRET",
+            "MATRIX_USER",
+            "MATRIX_TOKEN",
+            "MATRIX_DEVICE_ID",
+            "MATRIX_KEYS_FILE",
+            "MATRIX_KEYS_PASSPHRASE",
+            "MATRIX_ROOM_ID",
+            "GRAPHLIT_CITATION_LIMIT",
+    )):
+        st.error("Fill in all Graphlit and Matrix details first.")
     else:
-        with st.spinner("Fetching messages…"):
-            messages = asyncio.run(
-                retrieve_messages(
-                    room_id=st.session_state["MATRIX_ROOM_ID"]
-                )
-            )
-            for index, message in enumerate(messages):
-                with st.spinner(f"Processing message {index + 1} of {len(messages)}"):
-                    if message["type"] == "text":
-                        asyncio.run(ingest_text(message))
-                    elif message["type"] == "media":
-                        asyncio.run(ingest_media(message))
-                    else:
-                        raise Exception(f"Unknown message type: {message['type']}")
-        st.success("Synced to Graphlit!")
+        with st.spinner("Fetching messages..."):
+            room_ids = st.session_state["MATRIX_ROOM_ID"].split("\n")
+            messages = asyncio.run(retrieve_messages(room_ids=room_ids))
+
+        progress_bar = st.progress(0)
+        progress_text = st.text("Ingesting messages...")
+        counter = 0
+
+
+        async def process_message(message):
+            global counter
+            if message["type"] == "text":
+                await ingest_text(message)
+            elif message["type"] == "media":
+                await ingest_media(message)
+            else:
+                raise Exception(f"Unknown message type: {message['type']}")
+
+            counter += 1
+            progress_bar.progress(counter / len(messages))
+            progress_text.text(f"Ingesting {counter}/{len(messages)} messages...")
+
+
+        tasks = [process_message(message) for message in messages]
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(asyncio.gather(*tasks))
+
+        st.success("Sync completed successfully!")
 
 query = st.text_area("Ask a query:")
 if st.button("Submit"):
@@ -211,12 +310,14 @@ if st.button("Submit"):
         st.error("Enter a prompt.")
     else:
         rag_response = asyncio.run(ask_rag(query))
+        st.markdown("**Response:**")
         st.write(rag_response.message)
+        st.markdown("**Citations:**")
         if rag_response.citations:
             for index, citation in enumerate(rag_response.citations):
-                st.page_link(label=f"**Citation {index + 1}:**", page=citation.content.master_uri)
+                st.page_link(label=f"Citation {index + 1}", page=citation.content.master_uri)
                 if citation.content.mime_type.startswith("text/"):
-                    st.markdown(citation.text)
+                    st.text(citation.text)
                 elif citation.content.mime_type.startswith("image/"):
                     st.image(citation.content.uri)
                 else:
