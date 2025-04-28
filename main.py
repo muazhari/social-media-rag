@@ -310,15 +310,24 @@ if st.button("Submit"):
         st.error("Enter a prompt.")
     else:
         rag_response = asyncio.run(ask_rag(query))
-        st.markdown("**Response:**")
-        st.write(rag_response.message)
-        st.markdown("**Citations:**")
-        if rag_response.citations:
-            for index, citation in enumerate(rag_response.citations):
-                st.page_link(label=f"Citation {index + 1}", page=citation.content.master_uri)
-                if citation.content.mime_type.startswith("text/"):
-                    st.text(citation.text)
-                elif citation.content.mime_type.startswith("image/"):
-                    st.image(citation.content.uri)
-                else:
-                    raise Exception(f"Unknown content type: {citation.content.mime_type}")
+        st.session_state["rag_response"] = rag_response
+
+
+@st.dialog(title="Citation Details", width="large")
+def citation_details(citation):
+    st.write(citation)
+
+
+if "rag_response" in st.session_state:
+    st.markdown("**Response:**")
+    st.write(st.session_state["rag_response"].message)
+    st.markdown("**Citations:**")
+    for index, citation in enumerate(st.session_state["rag_response"].citations):
+        if st.button(label=f"Citation {index + 1}"):
+            citation_details(citation)
+        if citation.content.mime_type.startswith("text/"):
+            st.text(citation.text)
+        elif citation.content.mime_type.startswith("image/"):
+            st.image(citation.content.uri)
+        else:
+            raise Exception(f"Unknown content type: {citation.content.mime_type}")
