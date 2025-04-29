@@ -5,10 +5,10 @@
 ### 1. Install the dependencies.
 
 ```bash
-uv pip install -e .
+uv pip install -e . -U
 ```
 
-### 2. Run the example.
+### 2. Run the app.
 
 ```bash
 streamlit run main.py
@@ -18,7 +18,7 @@ streamlit run main.py
 - Input Beeper Matrix Credentials.
 - Input Room ID(s).
 - Input settings.
-- Click on the "Sync" button in the sidebar.
+- Click on the "Sync" button.
 
 ### 5. Question and Answer.
 - Input your query in the text box.

@@ -13,7 +13,8 @@ from graphlit_api import ContentFilter, ConversationInput, SpecificationInput, G
     GoogleModelPropertiesInput, EntityReferenceInput, ConversationStrategyInput, RetrievalStrategyInput, \
     RetrievalStrategyTypes
 from nio import AsyncClient, RoomMessageText, RoomMessageMedia, SyncError, RoomMessagesError, \
-    AsyncClientConfig, RoomEncryptedMedia
+    AsyncClientConfig, RoomEncryptedMedia, DownloadError
+from nio.crypto import decrypt_attachment
 
 
 async def make_graphlit_client():
@@ -66,46 +67,6 @@ async def make_matrix_client():
     return matrix_client
 
 
-async def retrieve_messages(room_ids: [str]):
-    matrix_client = await make_matrix_client()
-    room_messages_responses = []
-    for room_id in room_ids:
-        room_messages_response = await matrix_client.room_messages(
-            room_id=room_id,
-            limit=sys.maxsize,
-        )
-        if isinstance(room_messages_response, RoomMessagesError):
-            raise Exception(f"Room messages fetch failed: {room_messages_response}")
-        room_messages_responses.append(room_messages_response)
-
-    messages = []
-    for room_messages_response in room_messages_responses:
-        for event in room_messages_response.chunk:
-            print(type(event))
-            print(event.__dict__)
-
-            if isinstance(event, RoomMessageText):
-                messages.append({
-                    "type": "text",
-                    "text": event.body,
-                    "sender": event.sender,
-                    "timestamp": event.server_timestamp,
-                })
-            elif isinstance(event, RoomMessageMedia):
-                uri = await matrix_client.mxc_to_http(event.url)
-                messages.append({
-                    "type": "media",
-                    "mxc": event.url,
-                    "uri": uri,
-                    "sender": event.sender,
-                    "timestamp": event.server_timestamp,
-                })
-            elif isinstance(event, RoomEncryptedMedia):
-                st.toast("Encrypted media message is not supported, skipping...")
-    await matrix_client.close()
-    return messages
-
-
 async def ingest_text(message: dict):
     graphlit_client = await make_graphlit_client()
     data_byte = message["text"].encode("utf-8")
@@ -137,11 +98,23 @@ async def ingest_media(message: dict):
         )
     )
     if len(found_contents.contents.results) == 0:
-        return await graphlit_client.ingest_uri(
-            name=content_hash,
-            uri=message["uri"],
-            is_synchronous=True
-        )
+        if message["type"] == "encrypted_media":
+            data_b64 = base64.b64encode(message["decrypted_data"]).decode("utf-8")
+            return await graphlit_client.ingest_encoded_file(
+                name=content_hash,
+                data=data_b64,
+                mime_type=message["mime_type"],
+                is_synchronous=True
+            )
+        elif message["type"] == "media":
+            return await graphlit_client.ingest_uri(
+                name=content_hash,
+                uri=message["uri"],
+                mime_type=message["mime_type"],
+                is_synchronous=True
+            )
+        else:
+            raise Exception(f"Unknown message type: {message['type']}")
     return found_contents.contents.results[0]
 
 
@@ -201,7 +174,7 @@ async def ask_rag(query: str):
 # --- Streamlit UI -----------------------------------------
 st.title("social-media-rag")
 
-st.sidebar.header("Credentials")
+st.sidebar.header("Configurations")
 st.sidebar.text_input(
     label="Graphlit Organization ID",
     key="GRAPHLIT_ORGANIZATION_ID",
@@ -274,34 +247,105 @@ if st.sidebar.button("Sync"):
     )):
         st.error("Fill in all Graphlit and Matrix details first.")
     else:
-        with st.spinner("Fetching messages..."):
-            room_ids = st.session_state["MATRIX_ROOM_ID"].split("\n")
-            messages = asyncio.run(retrieve_messages(room_ids=room_ids))
-
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         progress_bar = st.progress(0)
-        progress_text = st.text("Ingesting messages...")
-        counter = 0
+        progress_text = st.text("Initializing...")
+        fetch_message_counter = 0
+        process_event_counter = 0
+        ingest_message_counter = 0
+        room_ids = st.session_state["MATRIX_ROOM_ID"].split("\n")
+        matrix_client = loop.run_until_complete(make_matrix_client())
 
 
-        async def process_message(message):
-            global counter
-            if message["type"] == "text":
+        async def fetch_messages(room_id):
+            global fetch_message_counter, progress_bar, progress_text
+            room_messages_response = await matrix_client.room_messages(
+                room_id=room_id,
+                limit=sys.maxsize,
+            )
+            if isinstance(room_messages_response, RoomMessagesError):
+                raise Exception(f"Room messages fetch failed: {room_messages_response}")
+
+            fetch_message_counter += 1
+            progress_bar.progress(fetch_message_counter / len(room_ids))
+            progress_text.text(f"Fetching {fetch_message_counter}/{len(room_ids)} room messages...")
+            return room_messages_response
+
+
+        fetch_messages_tasks = [fetch_messages(room_id) for room_id in room_ids]
+        fetched_messages = loop.run_until_complete(asyncio.gather(*fetch_messages_tasks))
+        events = [event for room_messages in fetched_messages for event in room_messages.chunk]
+
+
+        async def process_event(event):
+            global process_event_counter, progress_bar, progress_text
+            print(type(event))
+            print(event.__dict__)
+            if isinstance(event, RoomMessageText):
+                return {
+                    "type": "text",
+                    "text": event.body,
+                    "sender": event.sender,
+                    "timestamp": event.server_timestamp,
+                }
+            elif isinstance(event, RoomMessageMedia):
+                uri = await matrix_client.mxc_to_http(event.url)
+                return {
+                    "type": "media",
+                    "mxc": event.url,
+                    "uri": uri,
+                    "sender": event.sender,
+                    "mime_type": event.source["content"]["info"]["mimetype"],
+                    "timestamp": event.server_timestamp,
+                }
+            elif isinstance(event, RoomEncryptedMedia):
+                download_response = await matrix_client.download(event.url)
+                if isinstance(download_response, DownloadError):
+                    raise Exception(f"Download failed: {download_response}")
+                decrypted_attachment = decrypt_attachment(
+                    ciphertext=download_response.body,
+                    key=event.key["k"],
+                    hash=event.hashes["sha256"],
+                    iv=event.iv,
+                )
+                return {
+                    "type": "encrypted_media",
+                    "mime_type": event.mimetype,
+                    "decrypted_data": decrypted_attachment,
+                    "mxc": event.url,
+                    "sender": event.sender,
+                    "timestamp": event.server_timestamp,
+                }
+
+            process_event_counter += 1
+            progress_bar.progress(process_event_counter / len(events))
+            progress_text.text(f"Fetching {process_event_counter}/{len(events)} events...")
+            return None
+
+
+        process_event_tasks = [process_event(event) for event in events]
+        process_event_results = loop.run_until_complete(asyncio.gather(*process_event_tasks))
+        messages = [message for message in process_event_results if message is not None]
+
+
+        async def ingest_message(message):
+            global ingest_message_counter, progress_bar, progress_text
+            if message["type"] in ["text"]:
                 await ingest_text(message)
-            elif message["type"] == "media":
+            elif message["type"] in ["media", "encrypted_media"]:
                 await ingest_media(message)
             else:
                 raise Exception(f"Unknown message type: {message['type']}")
 
-            counter += 1
-            progress_bar.progress(counter / len(messages))
-            progress_text.text(f"Ingesting {counter}/{len(messages)} messages...")
+            ingest_message_counter += 1
+            progress_bar.progress(ingest_message_counter / len(messages))
+            progress_text.text(f"Ingesting {ingest_message_counter}/{len(messages)} messages...")
 
 
-        tasks = [process_message(message) for message in messages]
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(asyncio.gather(*tasks))
-
+        ingest_message_tasks = [ingest_message(message) for message in messages]
+        loop.run_until_complete(asyncio.gather(*ingest_message_tasks))
+        loop.run_until_complete(matrix_client.close())
         st.success("Sync completed successfully!")
 
 query = st.text_area("Ask a query:")
