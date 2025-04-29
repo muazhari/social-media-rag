@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import json
 import os
 import sys
 from datetime import datetime
@@ -11,10 +12,14 @@ import streamlit as st
 from graphlit import Graphlit
 from graphlit_api import ContentFilter, ConversationInput, SpecificationInput, GoogleModels, ModelServiceTypes, \
     GoogleModelPropertiesInput, EntityReferenceInput, ConversationStrategyInput, RetrievalStrategyInput, \
-    RetrievalStrategyTypes
+    RetrievalStrategyTypes, ExtractionWorkflowStageInput, ExtractionWorkflowJobInput, EntityExtractionConnectorInput, \
+    EntityExtractionServiceTypes, ModelImageExtractionPropertiesInput, SpecificationTypes, WorkflowInput
 from nio import AsyncClient, RoomMessageText, RoomMessageMedia, SyncError, RoomMessagesError, \
     AsyncClientConfig, RoomEncryptedMedia, DownloadError
 from nio.crypto import decrypt_attachment
+
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 
 async def make_graphlit_client():
@@ -98,20 +103,58 @@ async def ingest_media(message: dict):
         )
     )
     if len(found_contents.contents.results) == 0:
+        create_specification_response = await graphlit_client.create_specification(
+            specification=SpecificationInput(
+                name=f"social-media-rag-extraction-specification",
+                customInstructions="Create highly detailed descriptions.",
+                type=SpecificationTypes.EXTRACTION,
+                serviceType=ModelServiceTypes.GOOGLE,
+                google=GoogleModelPropertiesInput(
+                    model=GoogleModels.GEMINI_2_5_FLASH_PREVIEW
+                ),
+            )
+        )
+        create_workflow_response = await graphlit_client.create_workflow(
+            workflow=WorkflowInput(
+                name=f"social-media-rag-extraction-workflow",
+                extraction=ExtractionWorkflowStageInput(
+                    jobs=[
+                        ExtractionWorkflowJobInput(
+                            connector=EntityExtractionConnectorInput(
+                                type=EntityExtractionServiceTypes.MODEL_IMAGE,
+                                modelImage=ModelImageExtractionPropertiesInput(
+                                    specification=EntityReferenceInput(
+                                        id=create_specification_response.create_specification.id
+                                    ) \
+                                    )
+                            )
+                        )
+                    ]
+                )
+            )
+        )
+
+        if message["mime_type"].startswith("image/"):
+            ingestion_workflow = EntityReferenceInput(id=create_workflow_response.create_workflow.id)
+        else:
+            ingestion_workflow = None
+
         if message["type"] == "encrypted_media":
             data_b64 = base64.b64encode(message["decrypted_data"]).decode("utf-8")
             return await graphlit_client.ingest_encoded_file(
                 name=content_hash,
                 data=data_b64,
                 mime_type=message["mime_type"],
-                is_synchronous=True
+                is_synchronous=True,
+                workflow=ingestion_workflow
             )
         elif message["type"] == "media":
             return await graphlit_client.ingest_uri(
                 name=content_hash,
                 uri=message["uri"],
                 mime_type=message["mime_type"],
-                is_synchronous=True
+                is_synchronous=True,
+                workflow=ingestion_workflow
             )
         else:
             raise Exception(f"Unknown message type: {message['type']}")
@@ -147,7 +190,8 @@ async def ask_rag(query: str):
         """
     create_specification_response = await graphlit_client.create_specification(
         specification=SpecificationInput(
-            name=f"social-media-rag-specification",
+            name=f"social-media-rag-conversation-specification",
+            type=SpecificationTypes.COMPLETION,
             serviceType=ModelServiceTypes.GOOGLE,
             google=GoogleModelPropertiesInput(
                 model=GoogleModels.GEMINI_2_5_PRO_PREVIEW
@@ -171,7 +215,7 @@ async def ask_rag(query: str):
     return prompt_conversation_response.prompt_conversation.message
 
 
-# --- Streamlit UI -----------------------------------------
+# Streamlit UI
 st.title("social-media-rag")
 
 st.sidebar.header("Configurations")
@@ -247,8 +291,8 @@ if st.sidebar.button("Sync"):
     )):
         st.error("Fill in all Graphlit and Matrix details first.")
     else:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        if "rag_response" in st.session_state:
+            del st.session_state["rag_response"]
         progress_bar = st.progress(0)
         progress_text = st.text("Initializing...")
         fetch_message_counter = 0
@@ -275,13 +319,11 @@ if st.sidebar.button("Sync"):
 
         fetch_messages_tasks = [fetch_messages(room_id) for room_id in room_ids]
         fetched_messages = loop.run_until_complete(asyncio.gather(*fetch_messages_tasks))
-        events = [event for room_messages in fetched_messages for event in room_messages.chunk]
+        events = [event for room_messages_response in fetched_messages for event in room_messages_response.chunk]
 
 
         async def process_event(event):
             global process_event_counter, progress_bar, progress_text
-            print(type(event))
-            print(event.__dict__)
             if isinstance(event, RoomMessageText):
                 return {
                     "type": "text",
@@ -353,13 +395,14 @@ if st.button("Submit"):
     if not query:
         st.error("Enter a prompt.")
     else:
-        rag_response = asyncio.run(ask_rag(query))
+        rag_response = loop.run_until_complete(ask_rag(query))
         st.session_state["rag_response"] = rag_response
 
 
 @st.dialog(title="Citation Details", width="large")
 def citation_details(citation):
-    st.write(citation)
+    citation_dict = json.loads(json.dumps(citation, default=lambda o: o.__dict__))
+    st.write(citation_dict)
 
 
 if "rag_response" in st.session_state:
@@ -372,6 +415,6 @@ if "rag_response" in st.session_state:
         if citation.content.mime_type.startswith("text/"):
             st.text(citation.text)
         elif citation.content.mime_type.startswith("image/"):
-            st.image(citation.content.uri)
+            st.image(citation.content.master_uri)
         else:
             raise Exception(f"Unknown content type: {citation.content.mime_type}")
