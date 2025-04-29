@@ -416,5 +416,11 @@ if "rag_response" in st.session_state:
             st.text(citation.text)
         elif citation.content.mime_type.startswith("image/"):
             st.image(citation.content.master_uri)
+        elif citation.content.mime_type.startswith("application/"):
+            st.link_button(
+                label=f"{citation.content.file_name}",
+                url=citation.content.master_uri,
+            )
+            st.write(citation.text)
         else:
             raise Exception(f"Unknown content type: {citation.content.mime_type}")
