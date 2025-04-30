@@ -261,7 +261,7 @@ async def ask_rag(query: str):
             retrievalStrategy=RetrievalStrategyInput(
                 type=RetrievalStrategyTypes.CHUNK,
             ),
-            numberSimilar=st.session_state["GRAPHLIT_CITATION_LIMIT"]
+            numberSimilar=st.session_state["CITATION_LIMIT"]
         )
     )
     prompt_conversation_response = await graphlit_client.prompt_conversation(
@@ -328,11 +328,10 @@ st.sidebar.text_area(
     help="Enter one or more room IDs, separated by new lines."
 )
 st.sidebar.number_input(
-    label="Graphlit Citation Limit",
-    key="GRAPHLIT_CITATION_LIMIT",
-    value=100,
-    min_value=1,
-    help="The maximum number of citations can be retrieved."
+    label="Citation Limit",
+    key="CITATION_LIMIT",
+    value=15,
+    min_value=1
 )
 
 if st.sidebar.button("Sync Configurations"):
@@ -346,7 +345,7 @@ if st.sidebar.button("Sync Configurations"):
             "MATRIX_KEYS_FILE",
             "MATRIX_KEYS_PASSPHRASE",
             "MATRIX_ROOM_ID",
-            "GRAPHLIT_CITATION_LIMIT",
+            "CITATION_LIMIT",
     )):
         st.error("Fill in all Graphlit and Matrix details first.")
     else:
@@ -411,7 +410,7 @@ if st.sidebar.button("Sync Configurations"):
         process_event_results = loop.run_until_complete(asyncio.gather(*process_event_tasks))
         st.success("Sync completed successfully!")
 
-if st.sidebar.button("Clear Data"):
+if st.sidebar.button("Reset"):
     graphlit_client: Client = loop.run_until_complete(make_graphlit_client())
     loop.run_until_complete(graphlit_client.delete_all_contents())
     loop.run_until_complete(graphlit_client.delete_all_specifications())

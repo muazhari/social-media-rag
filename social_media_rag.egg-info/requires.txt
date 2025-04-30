@@ -1,4 +1,15 @@
 pydantic
 streamlit
 matrix-nio[e2e]
-graphlit-client
+langchain_community
+pdf2image
+langchain
+langgraph
+langsmith
+langchain-milvus
+langchain-cohere
+langchain-voyageai
+langchain-nomic
+langchain-google-genai
+pymilvus
+nest_asyncio

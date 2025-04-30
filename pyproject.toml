@@ -7,5 +7,23 @@ dependencies = [
     "pydantic",
     "streamlit",
     "matrix-nio[e2e]",
-    "graphlit-client",
+    "graplit-python",
+    "langchain_community",
+    "pdf2image",
+    "langchain",
+    "langgraph",
+    "langsmith",
+    "langchain-milvus",
+    "langchain-cohere",
+    "langchain-voyageai",
+    "langchain-nomic",
+    "langchain-google-genai",
+    "pymilvus",
+    "nest_asyncio",
+]
+
+[tool.setuptools.packages.find]
+exclude = [
+    "encryption_keys",
+    "assets"
 ]
