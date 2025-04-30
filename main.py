@@ -13,7 +13,8 @@ from graphlit import Graphlit
 from graphlit_api import ContentFilter, ConversationInput, SpecificationInput, GoogleModels, ModelServiceTypes, \
     GoogleModelPropertiesInput, EntityReferenceInput, ConversationStrategyInput, RetrievalStrategyInput, \
     RetrievalStrategyTypes, ExtractionWorkflowStageInput, ExtractionWorkflowJobInput, EntityExtractionConnectorInput, \
-    EntityExtractionServiceTypes, ModelImageExtractionPropertiesInput, SpecificationTypes, WorkflowInput
+    EntityExtractionServiceTypes, ModelImageExtractionPropertiesInput, SpecificationTypes, WorkflowInput, \
+    Client
 from nio import AsyncClient, RoomMessageText, RoomMessageMedia, SyncError, RoomMessagesError, \
     AsyncClientConfig, RoomEncryptedMedia, DownloadError
 from nio.crypto import decrypt_attachment
@@ -43,9 +44,9 @@ async def make_matrix_client():
         )
     )
     matrix_client.restore_login(
-        user_id=st.session_state["MATRIX_USER"],
+        user_id=st.session_state["MATRIX_USER_ID"],
         device_id=st.session_state["MATRIX_DEVICE_ID"],
-        access_token=st.session_state["MATRIX_TOKEN"],
+        access_token=st.session_state["MATRIX_ACCESS_TOKEN"],
     )
 
     keys_file_path = str(store_dir / "keys.txt")
@@ -72,9 +73,9 @@ async def make_matrix_client():
     return matrix_client
 
 
-async def ingest_text(message: dict):
-    graphlit_client = await make_graphlit_client()
-    data_byte = message["text"].encode("utf-8")
+async def ingest_text(event: RoomMessageText):
+    graphlit_client: Client = st.session_state["graphlit_client"]
+    data_byte = event.body.encode("utf-8")
     data_b64 = base64.b64encode(data_byte).decode("utf-8")
     content_hash = hashlib.sha256(data_byte).hexdigest()
     found_contents = await graphlit_client.query_contents(
@@ -93,9 +94,10 @@ async def ingest_text(message: dict):
     return found_contents.contents.results[0]
 
 
-async def ingest_media(message: dict):
-    graphlit_client = await make_graphlit_client()
-    content_hash = hashlib.sha256(message["mxc"].encode("utf-8")).hexdigest()
+async def ingest_media(event: RoomMessageMedia):
+    matrix_client: AsyncClient = st.session_state["matrix_client"]
+    graphlit_client: Client = st.session_state["graphlit_client"]
+    content_hash = hashlib.sha256(event.url.encode("utf-8")).hexdigest()
     found_contents = await graphlit_client.query_contents(
         filter=ContentFilter(
             name=content_hash,
@@ -103,6 +105,7 @@ async def ingest_media(message: dict):
         )
     )
     if len(found_contents.contents.results) == 0:
+        uri = await matrix_client.mxc_to_http(event.url)
         create_specification_response = await graphlit_client.create_specification(
             specification=SpecificationInput(
                 name=f"social-media-rag-extraction-specification",
@@ -125,8 +128,8 @@ async def ingest_media(message: dict):
                                 modelImage=ModelImageExtractionPropertiesInput(
                                     specification=EntityReferenceInput(
                                         id=create_specification_response.create_specification.id
-                                    ) \
                                     )
+                                )
                             )
                         )
                     ]
@@ -134,37 +137,93 @@ async def ingest_media(message: dict):
             )
         )
 
-        if message["mime_type"].startswith("image/"):
+        if event.source["content"]["info"]["mimetype"].startswith("image/"):
             ingestion_workflow = EntityReferenceInput(id=create_workflow_response.create_workflow.id)
         else:
             ingestion_workflow = None
 
-        if message["type"] == "encrypted_media":
-            data_b64 = base64.b64encode(message["decrypted_data"]).decode("utf-8")
-            return await graphlit_client.ingest_encoded_file(
-                name=content_hash,
-                data=data_b64,
-                mime_type=message["mime_type"],
-                is_synchronous=True,
-                workflow=ingestion_workflow
+        return await graphlit_client.ingest_uri(
+            name=content_hash,
+            uri=uri,
+            mime_type=event.source["content"]["info"]["mimetype"],
+            is_synchronous=True,
+            workflow=ingestion_workflow
+        )
+    return found_contents.contents.results[0]
+
+
+async def ingest_encrypted_media(event: RoomEncryptedMedia):
+    matrix_client: AsyncClient = st.session_state["matrix_client"]
+    graphlit_client: Client = st.session_state["graphlit_client"]
+    content_hash = hashlib.sha256(event.url.encode("utf-8")).hexdigest()
+    found_contents = await graphlit_client.query_contents(
+        filter=ContentFilter(
+            name=content_hash,
+            limit=1,
+        )
+    )
+    if len(found_contents.contents.results) == 0:
+        download_response = await matrix_client.download(event.url)
+        if isinstance(download_response, DownloadError):
+            raise Exception(f"Download failed: {download_response}")
+        decrypted_data = decrypt_attachment(
+            ciphertext=download_response.body,
+            key=event.key["k"],
+            hash=event.hashes["sha256"],
+            iv=event.iv,
+        )
+        data_b64 = base64.b64encode(decrypted_data).decode("utf-8")
+
+        create_specification_response = await graphlit_client.create_specification(
+            specification=SpecificationInput(
+                name=f"social-media-rag-extraction-specification",
+                customInstructions="Create highly detailed descriptions.",
+                type=SpecificationTypes.EXTRACTION,
+                serviceType=ModelServiceTypes.GOOGLE,
+                google=GoogleModelPropertiesInput(
+                    model=GoogleModels.GEMINI_2_5_FLASH_PREVIEW
+                ),
             )
-        elif message["type"] == "media":
-            return await graphlit_client.ingest_uri(
-                name=content_hash,
-                uri=message["uri"],
-                mime_type=message["mime_type"],
-                is_synchronous=True,
-                workflow=ingestion_workflow
+        )
+        create_workflow_response = await graphlit_client.create_workflow(
+            workflow=WorkflowInput(
+                name=f"social-media-rag-extraction-workflow",
+                extraction=ExtractionWorkflowStageInput(
+                    jobs=[
+                        ExtractionWorkflowJobInput(
+                            connector=EntityExtractionConnectorInput(
+                                type=EntityExtractionServiceTypes.MODEL_IMAGE,
+                                modelImage=ModelImageExtractionPropertiesInput(
+                                    specification=EntityReferenceInput(
+                                        id=create_specification_response.create_specification.id
+                                    )
+                                )
+                            )
+                        )
+                    ]
+                )
             )
+        )
+
+        if event.source["content"]["info"]["mimetype"].startswith("image/"):
+            ingestion_workflow = EntityReferenceInput(id=create_workflow_response.create_workflow.id)
         else:
-            raise Exception(f"Unknown message type: {message['type']}")
+            ingestion_workflow = None
+
+        return await graphlit_client.ingest_encoded_file(
+            name=content_hash,
+            data=data_b64,
+            mime_type=event.mimetype,
+            is_synchronous=True,
+            workflow=ingestion_workflow
+        )
     return found_contents.contents.results[0]
 
 
 async def start_or_get_conversation():
-    graphlit_client = await make_graphlit_client()
+    graphlit_client: Client = st.session_state["graphlit_client"]
     # for simplicity, we store one conversation per session.
-    # clear cache if the user wants to start a new conversation
+    # clear cache if the user wants to start a new conversation.
     if "conversation_id" not in st.session_state:
         create_conversation = await graphlit_client.create_conversation(
             conversation=ConversationInput(
@@ -176,7 +235,7 @@ async def start_or_get_conversation():
 
 
 async def ask_rag(query: str):
-    graphlit_client = await make_graphlit_client()
+    graphlit_client: Client = st.session_state["graphlit_client"]
     conversation_id = await start_or_get_conversation()
     prompt = f"""
         <instruction>
@@ -201,8 +260,8 @@ async def ask_rag(query: str):
             ),
             retrievalStrategy=RetrievalStrategyInput(
                 type=RetrievalStrategyTypes.CHUNK,
-                contentLimit=st.session_state["GRAPHLIT_CITATION_LIMIT"],
-            )
+            ),
+            numberSimilar=st.session_state["GRAPHLIT_CITATION_LIMIT"]
         )
     )
     prompt_conversation_response = await graphlit_client.prompt_conversation(
@@ -236,15 +295,15 @@ st.sidebar.text_input(
     value=os.environ.get("GRAPHLIT_SECRET")
 )
 st.sidebar.text_input(
-    label="Matrix User",
-    key="MATRIX_USER",
-    value=os.environ.get("MATRIX_USER")
+    label="Matrix User ID",
+    key="MATRIX_USER_ID",
+    value=os.environ.get("MATRIX_USER_ID")
 )
 st.sidebar.text_input(
-    label="Matrix Token",
-    key="MATRIX_TOKEN",
+    label="Matrix Access Token",
+    key="MATRIX_ACCESS_TOKEN",
     type="password",
-    value=os.environ.get("MATRIX_TOKEN")
+    value=os.environ.get("MATRIX_ACCESS_TOKEN")
 )
 st.sidebar.text_input(
     label="Matrix Device ID",
@@ -276,13 +335,13 @@ st.sidebar.number_input(
     help="The maximum number of citations can be retrieved."
 )
 
-if st.sidebar.button("Sync"):
+if st.sidebar.button("Sync Configurations"):
     if not all(st.session_state[k] for k in (
             "GRAPHLIT_ORGANIZATION_ID",
             "GRAPHLIT_ENVIRONMENT_ID",
             "GRAPHLIT_SECRET",
-            "MATRIX_USER",
-            "MATRIX_TOKEN",
+            "MATRIX_USER_ID",
+            "MATRIX_ACCESS_TOKEN",
             "MATRIX_DEVICE_ID",
             "MATRIX_KEYS_FILE",
             "MATRIX_KEYS_PASSPHRASE",
@@ -291,19 +350,24 @@ if st.sidebar.button("Sync"):
     )):
         st.error("Fill in all Graphlit and Matrix details first.")
     else:
+        st.session_state["matrix_client"] = loop.run_until_complete(make_matrix_client())
+        st.session_state["graphlit_client"] = loop.run_until_complete(make_graphlit_client())
         if "rag_response" in st.session_state:
             del st.session_state["rag_response"]
         progress_bar = st.progress(0)
         progress_text = st.text("Initializing...")
         fetch_message_counter = 0
         process_event_counter = 0
-        ingest_message_counter = 0
         room_ids = st.session_state["MATRIX_ROOM_ID"].split("\n")
-        matrix_client = loop.run_until_complete(make_matrix_client())
 
 
         async def fetch_messages(room_id):
             global fetch_message_counter, progress_bar, progress_text
+            matrix_client: AsyncClient = st.session_state["matrix_client"]
+            fetch_message_counter += 1
+            progress_bar.progress(fetch_message_counter / len(room_ids))
+            progress_text.text(f"Fetching {fetch_message_counter}/{len(room_ids)} room messages...")
+
             room_messages_response = await matrix_client.room_messages(
                 room_id=room_id,
                 limit=sys.maxsize,
@@ -311,84 +375,51 @@ if st.sidebar.button("Sync"):
             if isinstance(room_messages_response, RoomMessagesError):
                 raise Exception(f"Room messages fetch failed: {room_messages_response}")
 
-            fetch_message_counter += 1
-            progress_bar.progress(fetch_message_counter / len(room_ids))
-            progress_text.text(f"Fetching {fetch_message_counter}/{len(room_ids)} room messages...")
             return room_messages_response
 
 
         fetch_messages_tasks = [fetch_messages(room_id) for room_id in room_ids]
         fetched_messages = loop.run_until_complete(asyncio.gather(*fetch_messages_tasks))
-        events = [event for room_messages_response in fetched_messages for event in room_messages_response.chunk]
+        events = []
+        for fetched_message in fetched_messages:
+            for event in fetched_message.chunk:
+                if any([
+                    isinstance(event, RoomMessageText),
+                    isinstance(event, RoomMessageMedia),
+                    isinstance(event, RoomEncryptedMedia),
+                ]):
+                    events.append(event)
 
 
         async def process_event(event):
             global process_event_counter, progress_bar, progress_text
-            if isinstance(event, RoomMessageText):
-                return {
-                    "type": "text",
-                    "text": event.body,
-                    "sender": event.sender,
-                    "timestamp": event.server_timestamp,
-                }
-            elif isinstance(event, RoomMessageMedia):
-                uri = await matrix_client.mxc_to_http(event.url)
-                return {
-                    "type": "media",
-                    "mxc": event.url,
-                    "uri": uri,
-                    "sender": event.sender,
-                    "mime_type": event.source["content"]["info"]["mimetype"],
-                    "timestamp": event.server_timestamp,
-                }
-            elif isinstance(event, RoomEncryptedMedia):
-                download_response = await matrix_client.download(event.url)
-                if isinstance(download_response, DownloadError):
-                    raise Exception(f"Download failed: {download_response}")
-                decrypted_attachment = decrypt_attachment(
-                    ciphertext=download_response.body,
-                    key=event.key["k"],
-                    hash=event.hashes["sha256"],
-                    iv=event.iv,
-                )
-                return {
-                    "type": "encrypted_media",
-                    "mime_type": event.mimetype,
-                    "decrypted_data": decrypted_attachment,
-                    "mxc": event.url,
-                    "sender": event.sender,
-                    "timestamp": event.server_timestamp,
-                }
-
             process_event_counter += 1
             progress_bar.progress(process_event_counter / len(events))
-            progress_text.text(f"Fetching {process_event_counter}/{len(events)} events...")
-            return None
+            progress_text.text(f"Processing {process_event_counter}/{len(events)} events...")
+
+            if isinstance(event, RoomMessageText):
+                return await ingest_text(event)
+            elif isinstance(event, RoomMessageMedia):
+                return await ingest_media(event)
+            elif isinstance(event, RoomEncryptedMedia):
+                return await ingest_encrypted_media(event)
+            else:
+                raise Exception(f"Unknown event type: {event}")
 
 
         process_event_tasks = [process_event(event) for event in events]
         process_event_results = loop.run_until_complete(asyncio.gather(*process_event_tasks))
-        messages = [message for message in process_event_results if message is not None]
-
-
-        async def ingest_message(message):
-            global ingest_message_counter, progress_bar, progress_text
-            if message["type"] in ["text"]:
-                await ingest_text(message)
-            elif message["type"] in ["media", "encrypted_media"]:
-                await ingest_media(message)
-            else:
-                raise Exception(f"Unknown message type: {message['type']}")
-
-            ingest_message_counter += 1
-            progress_bar.progress(ingest_message_counter / len(messages))
-            progress_text.text(f"Ingesting {ingest_message_counter}/{len(messages)} messages...")
-
-
-        ingest_message_tasks = [ingest_message(message) for message in messages]
-        loop.run_until_complete(asyncio.gather(*ingest_message_tasks))
-        loop.run_until_complete(matrix_client.close())
         st.success("Sync completed successfully!")
+
+if st.sidebar.button("Clear Data"):
+    graphlit_client: Client = loop.run_until_complete(make_graphlit_client())
+    loop.run_until_complete(graphlit_client.delete_all_contents())
+    loop.run_until_complete(graphlit_client.delete_all_specifications())
+    loop.run_until_complete(graphlit_client.delete_all_workflows())
+    loop.run_until_complete(graphlit_client.delete_all_conversations())
+
+    for key in st.session_state.keys():
+        del st.session_state[key]
 
 query = st.text_area("Ask a query:")
 if st.button("Submit"):
@@ -409,18 +440,21 @@ if "rag_response" in st.session_state:
     st.markdown("**Response:**")
     st.write(st.session_state["rag_response"].message)
     st.markdown("**Citations:**")
-    for index, citation in enumerate(st.session_state["rag_response"].citations):
-        if st.button(label=f"Citation {index + 1}"):
-            citation_details(citation)
-        if citation.content.mime_type.startswith("text/"):
-            st.text(citation.text)
-        elif citation.content.mime_type.startswith("image/"):
-            st.image(citation.content.master_uri)
-        elif citation.content.mime_type.startswith("application/"):
-            st.link_button(
-                label=f"{citation.content.file_name}",
-                url=citation.content.master_uri,
-            )
-            st.write(citation.text)
-        else:
-            raise Exception(f"Unknown content type: {citation.content.mime_type}")
+    if st.session_state["rag_response"].citations:
+        for index, citation in enumerate(st.session_state["rag_response"].citations):
+            if st.button(label=f"Citation {index + 1}"):
+                citation_details(citation)
+            if citation.content.mime_type.startswith("text/"):
+                st.text(citation.text)
+            elif citation.content.mime_type.startswith("image/"):
+                st.image(citation.content.master_uri)
+            elif citation.content.mime_type.startswith("application/"):
+                st.link_button(
+                    label=f"{citation.content.file_name}",
+                    url=citation.content.master_uri,
+                )
+                st.write(citation.text)
+            else:
+                raise Exception(f"Unknown content type: {citation.content.mime_type}")
+    else:
+        st.write("No citation available.")
