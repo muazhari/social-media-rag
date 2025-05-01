@@ -15,8 +15,6 @@ dependencies = [
     "langsmith",
     "langchain-milvus",
     "langchain-cohere",
-    "langchain-voyageai",
-    "langchain-nomic",
     "langchain-google-genai",
     "pymilvus",
     "nest_asyncio",

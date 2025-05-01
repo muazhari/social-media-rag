@@ -109,7 +109,7 @@ async def ingest_media(event: RoomMessageMedia):
         create_specification_response = await graphlit_client.create_specification(
             specification=SpecificationInput(
                 name=f"social-media-rag-extraction-specification",
-                customInstructions="Create highly detailed descriptions.",
+                customInstructions="Create detailed descriptions.",
                 type=SpecificationTypes.EXTRACTION,
                 serviceType=ModelServiceTypes.GOOGLE,
                 google=GoogleModelPropertiesInput(

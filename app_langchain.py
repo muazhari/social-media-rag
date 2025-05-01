@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import hashlib
 import io
 import os
@@ -10,6 +11,7 @@ import streamlit as st
 from langchain_cohere import CohereEmbeddings
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, BaseMessage
+from langchain_core.stores import InMemoryByteStore
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_milvus.vectorstores.milvus import Milvus
 from langgraph.graph import Graph
@@ -17,6 +19,9 @@ from langgraph.graph.graph import CompiledGraph
 from nio import AsyncClient, RoomMessageText, RoomMessageMedia, SyncError, RoomMessagesError, \
     AsyncClientConfig, RoomEncryptedMedia, DownloadError, Event
 from nio.crypto import decrypt_attachment
+
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 
 async def make_matrix_client():
@@ -67,7 +72,7 @@ async def describe_image(uri: str):
             "type": "text",
             "text": f"""
             <instruction>
-            Create highly detailed descriptions of the image.
+            Create detailed descriptions of the image.
             </instruction>
             """
         },
@@ -82,7 +87,6 @@ async def describe_image(uri: str):
 
 
 async def process_event(event: Event) -> [Document]:
-    print(event.source)
     matrix_client: AsyncClient = st.session_state["matrix_client"]
     if isinstance(event, RoomMessageText):
         id = hashlib.sha256(event.body.encode()).hexdigest()
@@ -92,6 +96,7 @@ async def process_event(event: Event) -> [Document]:
             metadata={
                 "event_type": "text",
                 "event_source": event.source,
+                "exclusion": {}
             }
         )
         return [document]
@@ -110,6 +115,10 @@ async def process_event(event: Event) -> [Document]:
                 metadata={
                     "event_type": "media",
                     "event_source": event.source,
+                    "exclusion": {
+                        "uri": uri,
+                        "data": download_response.body
+                    },
                 }
             )
             return [document]
@@ -118,6 +127,7 @@ async def process_event(event: Event) -> [Document]:
             return []
     elif isinstance(event, RoomEncryptedMedia):
         mime_type = event.source["content"]["info"]["mimetype"]
+        uri = await matrix_client.mxc_to_http(event.url)
         download_response = await matrix_client.download(event.url)
         if isinstance(download_response, DownloadError):
             raise Exception(f"Download failed: {download_response}")
@@ -137,6 +147,10 @@ async def process_event(event: Event) -> [Document]:
                 metadata={
                     "event_type": "encrypted_media",
                     "event_source": event.source,
+                    "exclusion": {
+                        "uri": uri,
+                        "data": decrypted_data
+                    },
                 }
             )
             return [document]
@@ -150,13 +164,22 @@ async def process_event(event: Event) -> [Document]:
 async def retrieve(state):
     query: str = state["query"]
     vector_store: Milvus = st.session_state["vector_store"]
-    documents: [Document] = vector_store.similarity_search(query, k=st.session_state["CITATION_LIMIT"])
-    state["documents"] = documents
+    byte_store: InMemoryByteStore = st.session_state["byte_store"]
+    retrieved_documents: [[Document, float]] = await vector_store.asimilarity_search_with_score(
+        query=query,
+        k=st.session_state["CITATION_LIMIT"]
+    )
+    cached_documents: [Document] = []
+    for retrieved_document, score in retrieved_documents:
+        document_id = retrieved_document.metadata["pk"]
+        cached_document: Document = (await byte_store.amget([document_id]))[0]
+        cached_document.metadata["retrieval_score"] = score
+        cached_documents.append(cached_document)
+    state["documents"] = cached_documents
     return state
 
 
 async def get_citations(index, document) -> [dict]:
-    matrix_client: AsyncClient = st.session_state["matrix_client"]
     event_type = document.metadata["event_type"]
     if event_type == "text":
         return [
@@ -170,7 +193,6 @@ async def get_citations(index, document) -> [dict]:
             }
         ]
     elif event_type == "media":
-        url = await matrix_client.mxc_to_http(document.metadata["event_source"]["url"])
         return [
             {
                 "type": "text",
@@ -180,7 +202,7 @@ async def get_citations(index, document) -> [dict]:
             },
             {
                 "type": "image_url",
-                "image_url": url,
+                "image_url": document.metadata["exclusion"]["uri"],
             },
             {
                 "type": "text",
@@ -191,16 +213,8 @@ async def get_citations(index, document) -> [dict]:
         ]
     elif event_type == "encrypted_media":
         mime_type = document.metadata["event_source"]["content"]["info"]["mimetype"]
-        download_response = await matrix_client.download(document.metadata["event_source"]["content"]["file"]["url"])
-        if isinstance(download_response, DownloadError):
-            raise Exception(f"Download failed: {download_response}")
-        decrypted_data = decrypt_attachment(
-            ciphertext=download_response.body,
-            key=document.metadata["event_source"]["content"]["file"]["key"]["k"],
-            hash=document.metadata["event_source"]["content"]["file"]["hashes"]["sha256"],
-            iv=document.metadata["event_source"]["content"]["file"]["iv"],
-        )
-        b64_data = base64.b64encode(decrypted_data).decode("utf-8")
+        data = document.metadata["exclusion"]["data"]
+        b64_data = base64.b64encode(data).decode("utf-8")
         url = f"data:{mime_type};base64,{b64_data}"
         return [
             {
@@ -338,7 +352,7 @@ st.sidebar.text_area(
 st.sidebar.number_input(
     label="Citation Limit",
     key="CITATION_LIMIT",
-    value=100,
+    value=15,
     min_value=1,
 )
 
@@ -357,10 +371,10 @@ if st.sidebar.button("Sync", use_container_width=True):
     if not all(st.session_state.get(k) for k in required_keys):
         st.error("Configure first.")
     else:
-        matrix_client: AsyncClient = asyncio.get_event_loop().run_until_complete(make_matrix_client())
+        matrix_client: AsyncClient = loop.run_until_complete(make_matrix_client())
         st.session_state["matrix_client"] = matrix_client
 
-        embeddings = CohereEmbeddings(
+        embedder = CohereEmbeddings(
             model="embed-v4.0",
             cohere_api_key=st.session_state["COHERE_API_KEY"]
         )
@@ -373,14 +387,18 @@ if st.sidebar.button("Sync", use_container_width=True):
             google_api_key=st.session_state["GOOGLE_API_KEY"]
         )
         vector_store = Milvus(
-            embedding_function=embeddings,
+            embedding_function=embedder,
             connection_args={"uri": st.session_state["ZILLIZ_URI"], "token": st.session_state["ZILLIZ_TOKEN"]},
             collection_name="social_media_rag",
             enable_dynamic_field=True,
+            index_params={"metric_type": "COSINE"},
+            search_params={"metric_type": "COSINE"},
         )
-        st.session_state["embeddings"] = embeddings
+        byte_store = InMemoryByteStore()
+        st.session_state["embedder"] = embedder
         st.session_state["generator_llm"] = generator_llm
         st.session_state["ingestor_llm"] = ingestor_llm
+        st.session_state.setdefault("byte_store", byte_store)
         st.session_state["vector_store"] = vector_store
 
         graph = Graph()
@@ -418,34 +436,44 @@ if st.sidebar.button("Sync", use_container_width=True):
             ingest_event_counter += 1
             progress_bar.progress(ingest_event_counter / len(events))
             progress_text.text(f"Ingesting {ingest_event_counter}/{len(events)} events...")
-            documents = await process_event(event)
+            documents: [Document] = await process_event(event)
             if len(documents) > 0:
-                ids = [document.id for document in documents]
-                await vector_store.aadd_documents(ids=ids, documents=documents)
+                document_ids = []
+                indexed_documents: [Document] = []
+                for document in documents:
+                    document_ids.append(document.id)
+                    indexed_document = copy.deepcopy(document)
+                    del indexed_document.metadata["exclusion"]
+                    indexed_documents.append(indexed_document)
+                await byte_store.amset(list(zip(document_ids, documents)))
+                await vector_store.aadd_documents(ids=document_ids, documents=indexed_documents)
 
 
         if is_do_ingestion:
             fetch_tasks = [fetch_messages(room_id) for room_id in room_ids]
-            fetched_messages = asyncio.get_event_loop().run_until_complete(asyncio.gather(*fetch_tasks))
+            fetched_messages = loop.run_until_complete(asyncio.gather(*fetch_tasks))
             events = [
                 event for fetched_message in fetched_messages for event in fetched_message.chunk
                 if isinstance(event, (RoomMessageText, RoomMessageMedia, RoomEncryptedMedia))
             ]
             ingest_tasks = [ingest_event(event) for event in events]
-            asyncio.get_event_loop().run_until_complete(asyncio.gather(*ingest_tasks))
+            loop.run_until_complete(asyncio.gather(*ingest_tasks))
 
         st.success("Sync successfully!")
 
 if st.sidebar.button("Reset", use_container_width=True):
-    required_keys = ["vector_store"]
+    required_keys = ["vector_store", "byte_store"]
     if not all(st.session_state.get(k) for k in required_keys):
         st.error("Configure first.")
     else:
-        milvus: Milvus = st.session_state["vector_store"]
-        if milvus.col:
-            milvus.col.drop()
+        vector_store: Milvus = st.session_state["vector_store"]
+        if vector_store.col:
+            vector_store.col.drop()
 
-        for key in list(st.session_state.keys()):
+        byte_store: InMemoryByteStore = st.session_state["byte_store"]
+        byte_store.mdelete(keys=list(byte_store.yield_keys()))
+
+        for key in st.session_state.keys():
             del st.session_state[key]
 
         st.success("Reset successfully!")
@@ -461,12 +489,12 @@ if st.button("Submit"):
     if not all(st.session_state.get(k) for k in required_keys):
         st.error("Configure first.")
     else:
-        matrix_client: AsyncClient = asyncio.get_event_loop().run_until_complete(make_matrix_client())
+        matrix_client: AsyncClient = loop.run_until_complete(make_matrix_client())
         st.session_state["matrix_client"] = matrix_client
 
         initial_state = {"query": query}
         qna_graph: CompiledGraph = st.session_state["qna_graph"]
-        final_state = asyncio.get_event_loop().run_until_complete(qna_graph.ainvoke(initial_state))
+        final_state = loop.run_until_complete(qna_graph.ainvoke(initial_state))
         st.session_state["rag_result"] = final_state
 
 
@@ -476,7 +504,7 @@ def citation_details(document: Document):
 
 
 if "rag_result" in st.session_state:
-    matrix_client: AsyncClient = asyncio.get_event_loop().run_until_complete(make_matrix_client())
+    matrix_client: AsyncClient = loop.run_until_complete(make_matrix_client())
     st.session_state["matrix_client"] = matrix_client
     st.markdown("**Response:**")
     st.write(st.session_state["rag_result"]["response"])
@@ -484,25 +512,16 @@ if "rag_result" in st.session_state:
     if st.session_state["rag_result"]["documents"]:
         for index, document in enumerate(st.session_state["rag_result"]["documents"]):
             event_type = document.metadata["event_type"]
-            if st.button(label=f"Citation {index + 1}"):
+            if st.button(label=f"Citation {index + 1}: {document.metadata['retrieval_score']}"):
                 citation_details(document)
             if event_type == "text":
                 st.text(document.page_content)
             elif event_type in "media":
-                uri = matrix_client.mxc_to_http(document.metadata["event_source"]["file"]["url"])
+                uri = document.metadata["exclusion"]["uri"]
                 st.image(uri)
             elif event_type in "encrypted_media":
-                mxc = document.metadata["event_source"]["content"]["file"]["url"]
-                download_response = asyncio.get_event_loop().run_until_complete(matrix_client.download(mxc))
-                if isinstance(download_response, DownloadError):
-                    raise Exception(f"Download failed: {download_response}")
-                decrypted_data = decrypt_attachment(
-                    ciphertext=download_response.body,
-                    key=document.metadata["event_source"]["content"]["file"]["key"]["k"],
-                    hash=document.metadata["event_source"]["content"]["file"]["hashes"]["sha256"],
-                    iv=document.metadata["event_source"]["content"]["file"]["iv"],
-                )
-                b64_data = base64.b64encode(decrypted_data).decode("utf-8")
+                data = document.metadata["exclusion"]["data"]
+                b64_data = base64.b64encode(data).decode("utf-8")
                 mime_type = document.metadata["event_source"]["content"]["info"]["mimetype"]
                 uri = f"data:{mime_type};base64,{b64_data}"
                 st.image(uri)
