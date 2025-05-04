@@ -19,8 +19,11 @@ from nio import AsyncClient, RoomMessageText, RoomMessageMedia, SyncError, RoomM
     AsyncClientConfig, RoomEncryptedMedia, DownloadError
 from nio.crypto import decrypt_attachment
 
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
+if "event_loop" not in st.session_state:
+    loop = asyncio.new_event_loop()
+    st.session_state["event_loop"] = loop
+
+asyncio.set_event_loop(st.session_state["event_loop"])
 
 
 async def make_graphlit_client():
@@ -349,8 +352,8 @@ if st.sidebar.button("Sync Configurations"):
     )):
         st.error("Fill in all Graphlit and Matrix details first.")
     else:
-        st.session_state["matrix_client"] = loop.run_until_complete(make_matrix_client())
-        st.session_state["graphlit_client"] = loop.run_until_complete(make_graphlit_client())
+        st.session_state["matrix_client"] = asyncio.get_event_loop().run_until_complete(make_matrix_client())
+        st.session_state["graphlit_client"] = asyncio.get_event_loop().run_until_complete(make_graphlit_client())
         if "rag_response" in st.session_state:
             del st.session_state["rag_response"]
         progress_bar = st.progress(0)
@@ -378,7 +381,7 @@ if st.sidebar.button("Sync Configurations"):
 
 
         fetch_messages_tasks = [fetch_messages(room_id) for room_id in room_ids]
-        fetched_messages = loop.run_until_complete(asyncio.gather(*fetch_messages_tasks))
+        fetched_messages = asyncio.get_event_loop().run_until_complete(asyncio.gather(*fetch_messages_tasks))
         events = []
         for fetched_message in fetched_messages:
             for event in fetched_message.chunk:
@@ -407,15 +410,15 @@ if st.sidebar.button("Sync Configurations"):
 
 
         process_event_tasks = [process_event(event) for event in events]
-        process_event_results = loop.run_until_complete(asyncio.gather(*process_event_tasks))
+        process_event_results = asyncio.get_event_loop().run_until_complete(asyncio.gather(*process_event_tasks))
         st.success("Sync completed successfully!")
 
 if st.sidebar.button("Reset"):
-    graphlit_client: Client = loop.run_until_complete(make_graphlit_client())
-    loop.run_until_complete(graphlit_client.delete_all_contents())
-    loop.run_until_complete(graphlit_client.delete_all_specifications())
-    loop.run_until_complete(graphlit_client.delete_all_workflows())
-    loop.run_until_complete(graphlit_client.delete_all_conversations())
+    graphlit_client: Client = asyncio.get_event_loop().run_until_complete(make_graphlit_client())
+    asyncio.get_event_loop().run_until_complete(graphlit_client.delete_all_contents())
+    asyncio.get_event_loop().run_until_complete(graphlit_client.delete_all_specifications())
+    asyncio.get_event_loop().run_until_complete(graphlit_client.delete_all_workflows())
+    asyncio.get_event_loop().run_until_complete(graphlit_client.delete_all_conversations())
 
     for key in st.session_state.keys():
         del st.session_state[key]
@@ -425,7 +428,7 @@ if st.button("Submit"):
     if not query:
         st.error("Enter a prompt.")
     else:
-        rag_response = loop.run_until_complete(ask_rag(query))
+        rag_response = asyncio.get_event_loop().run_until_complete(ask_rag(query))
         st.session_state["rag_response"] = rag_response
 
 

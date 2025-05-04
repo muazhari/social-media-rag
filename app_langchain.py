@@ -8,6 +8,7 @@ import pickle
 import sys
 import uuid
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 import streamlit as st
 from langchain.storage import LocalFileStore
@@ -23,7 +24,11 @@ from nio.crypto import decrypt_attachment
 from custom_cohere_embeddings import CustomCohereEmbeddings
 from custom_milvus import CustomMilvus
 
-loop = asyncio.new_event_loop()
+if "event_loop" not in st.session_state:
+    loop = asyncio.new_event_loop()
+    st.session_state["event_loop"] = loop
+
+loop = st.session_state["event_loop"]
 asyncio.set_event_loop(loop)
 store_path = Path("./store")
 store_path.mkdir(exist_ok=True)
@@ -71,7 +76,7 @@ async def make_matrix_client():
     return matrix_client
 
 
-async def process_event(event: Event) -> [Document]:
+async def process_event(event: Event) -> List[Document]:
     matrix_client: AsyncClient = st.session_state["matrix_client"]
     if isinstance(event, RoomMessageText):
         document = Document(
@@ -148,11 +153,11 @@ async def retrieve(state):
     query: str = state["query"]
     vector_store: CustomMilvus = st.session_state["vector_store"]
     file_store: LocalFileStore = st.session_state["file_store"]
-    retrieved_documents: [[Document, float]] = await vector_store.asimilarity_search_with_score(
+    retrieved_documents: List[Tuple[Document, float]] = await vector_store.asimilarity_search_with_score(
         query=query,
         k=st.session_state["CITATION_LIMIT"]
     )
-    cached_documents: [Document] = []
+    cached_documents: List[Document] = []
     for retrieved_document, score in retrieved_documents:
         document_id = retrieved_document.metadata["pk"]
         bytes_cached_document: bytes = (await file_store.amget([document_id]))[0]
@@ -163,7 +168,7 @@ async def retrieve(state):
     return state
 
 
-async def get_citations(index, document) -> [dict]:
+async def get_citations(index, document) -> List[Dict]:
     event_type = document.metadata["exclusion"]["event_type"]
     if event_type == "text":
         return [
@@ -220,7 +225,7 @@ async def get_citations(index, document) -> [dict]:
 
 async def format_prompt(state):
     query: str = state["query"]
-    documents: [Document] = state["documents"]
+    documents: List[Document] = state["documents"]
 
     citations = []
     for index, document in enumerate(documents):
@@ -412,7 +417,7 @@ if st.sidebar.button("Sync", use_container_width=True):
             ingest_event_counter += 1
             progress_bar.progress(ingest_event_counter / len(events))
             progress_text.text(f"Ingesting {ingest_event_counter}/{len(events)} events...")
-            documents: [Document] = await process_event(event)
+            documents: List[Document] = await process_event(event)
 
             document_ids = []
             bytes_documents = []
@@ -475,9 +480,6 @@ if st.button("Submit"):
     if not all(st.session_state.get(k) for k in required_keys):
         st.error("Sync configuration first.")
     else:
-        matrix_client: AsyncClient = loop.run_until_complete(make_matrix_client())
-        st.session_state["matrix_client"] = matrix_client
-
         initial_state = {"query": query}
         qna_graph: CompiledGraph = st.session_state["qna_graph"]
         final_state = loop.run_until_complete(qna_graph.ainvoke(initial_state))
@@ -490,8 +492,6 @@ def citation_details(document: Document):
 
 
 if "rag_result" in st.session_state:
-    matrix_client: AsyncClient = loop.run_until_complete(make_matrix_client())
-    st.session_state["matrix_client"] = matrix_client
     st.markdown("**Response:**")
     st.write(st.session_state["rag_result"]["response"])
     st.markdown("**Citations:**")
