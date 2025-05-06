@@ -16,7 +16,6 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, BaseMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import Graph
-from langgraph.graph.graph import CompiledGraph
 from nio import AsyncClient, RoomMessageText, RoomMessageMedia, SyncError, RoomMessagesError, \
     AsyncClientConfig, RoomEncryptedMedia, DownloadError, Event
 from nio.crypto import decrypt_attachment
@@ -33,6 +32,82 @@ asyncio.set_event_loop(loop)
 store_path = Path("./store")
 store_path.mkdir(exist_ok=True)
 
+st.title("social-media-rag")
+
+st.sidebar.header("Configurations")
+cohere_api_key = st.sidebar.text_input(
+    label="Cohere API Key",
+    type="password",
+    value=os.environ.get("COHERE_API_KEY")
+)
+google_api_key = st.sidebar.text_input(
+    label="Google API Key",
+    type="password",
+    value=os.environ.get("GOOGLE_API_KEY")
+)
+zilliz_uri = st.sidebar.text_input(
+    label="Zilliz URI",
+    value=os.environ.get("ZILLIZ_URI")
+)
+zilliz_token = st.sidebar.text_input(
+    label="Zilliz Token",
+    type="password",
+    value=os.environ.get("ZILLIZ_TOKEN")
+)
+matrix_user_id = st.sidebar.text_input(
+    label="Matrix User ID",
+    value=os.environ.get("MATRIX_USER_ID")
+)
+matrix_access_token = st.sidebar.text_input(
+    label="Matrix Access Token",
+    type="password",
+    value=os.environ.get("MATRIX_ACCESS_TOKEN")
+)
+matrix_device_id = st.sidebar.text_input(
+    label="Matrix Device ID",
+    value=os.environ.get("MATRIX_DEVICE_ID")
+)
+matrix_keys_file = st.sidebar.file_uploader(
+    label="Matrix Keys File",
+    type="txt",
+)
+matrix_keys_passphrase = st.sidebar.text_input(
+    label="Matrix Keys Passphrase",
+    value=os.environ.get("MATRIX_KEYS_PASSPHRASE"),
+    type="password"
+)
+matrix_room_id = st.sidebar.text_area(
+    label="Matrix Room ID(s)",
+    value=os.environ.get("MATRIX_ROOM_ID"),
+    help="Enter one or more room IDs, separated by new lines."
+)
+collection_name = st.sidebar.text_input(
+    label="Collection Name",
+    value="social_media_rag",
+)
+citation_limit = st.sidebar.number_input(
+    label="Citation Limit",
+    value=15,
+)
+
+embedder = CustomCohereEmbeddings(
+    model="embed-v4.0",
+    cohere_api_key=cohere_api_key,
+)
+generator_llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-pro-exp-03-25",
+    google_api_key=google_api_key,
+)
+vector_store = CustomMilvus(
+    embedding_function=embedder,
+    connection_args={"uri": zilliz_uri, "token": zilliz_token},
+    collection_name=collection_name,
+    enable_dynamic_field=True,
+    index_params={"metric_type": "COSINE"},
+    search_params={"metric_type": "COSINE"},
+)
+file_store = LocalFileStore(root_path=store_path / "file_store" / collection_name)
+
 
 async def make_matrix_client():
     matrix_client = AsyncClient(
@@ -44,13 +119,13 @@ async def make_matrix_client():
         )
     )
     matrix_client.restore_login(
-        user_id=st.session_state["MATRIX_USER_ID"],
-        device_id=st.session_state["MATRIX_DEVICE_ID"],
-        access_token=st.session_state["MATRIX_ACCESS_TOKEN"],
+        user_id=matrix_user_id,
+        device_id=matrix_device_id,
+        access_token=matrix_access_token,
     )
 
     keys_file_path = store_path / "keys.txt"
-    current_keys_data = st.session_state["MATRIX_KEYS_FILE"].getvalue()
+    current_keys_data = matrix_keys_file.getvalue()
     current_keys_hash = hashlib.sha256(current_keys_data).hexdigest()
 
     if keys_file_path.exists():
@@ -66,7 +141,7 @@ async def make_matrix_client():
 
         await matrix_client.import_keys(
             infile=str(keys_file_path),
-            passphrase=st.session_state["MATRIX_KEYS_PASSPHRASE"],
+            passphrase=matrix_keys_passphrase,
         )
 
     sync_response = await matrix_client.sync(full_state=True, timeout=30000)
@@ -151,11 +226,9 @@ async def process_event(event: Event) -> List[Document]:
 
 async def retrieve(state):
     query: str = state["query"]
-    vector_store: CustomMilvus = st.session_state["vector_store"]
-    file_store: LocalFileStore = st.session_state["file_store"]
     retrieved_documents: List[Tuple[Document, float]] = await vector_store.asimilarity_search_with_score(
         query=query,
-        k=st.session_state["CITATION_LIMIT"]
+        k=citation_limit
     )
     cached_documents: List[Document] = []
     for retrieved_document, score in retrieved_documents:
@@ -269,221 +342,93 @@ async def format_prompt(state):
 
 async def generate(state):
     prompt: HumanMessage = state["prompt"]
-    llm: ChatGoogleGenerativeAI = st.session_state["generator_llm"]
-    response: BaseMessage = llm.invoke([prompt])
+    response: BaseMessage = await generator_llm.ainvoke([prompt])
     state["response"] = response.content
     return state
 
 
-st.title("social-media-rag")
+graph = Graph()
+graph.add_node("retrieve", retrieve)
+graph.add_node("format_prompt", format_prompt)
+graph.add_node("generate", generate)
+graph.add_edge("retrieve", "format_prompt")
+graph.add_edge("format_prompt", "generate")
+graph.set_entry_point("retrieve")
+graph.set_finish_point("generate")
+qna_graph = graph.compile()
 
-st.sidebar.header("Configurations")
-st.sidebar.text_input(
-    label="Cohere API Key",
-    key="COHERE_API_KEY",
-    type="password",
-    value=os.environ.get("COHERE_API_KEY")
-)
-st.sidebar.text_input(
-    label="Google API Key",
-    key="GOOGLE_API_KEY",
-    type="password",
-    value=os.environ.get("GOOGLE_API_KEY")
-)
-st.sidebar.text_input(
-    label="Zilliz URI",
-    key="ZILLIZ_URI",
-    value=os.environ.get("ZILLIZ_URI")
-)
-st.sidebar.text_input(
-    label="Zilliz Token",
-    key="ZILLIZ_TOKEN",
-    type="password",
-    value=os.environ.get("ZILLIZ_TOKEN")
-)
-st.sidebar.text_input(
-    label="Matrix User ID",
-    key="MATRIX_USER_ID",
-    value=os.environ.get("MATRIX_USER_ID")
-)
-st.sidebar.text_input(
-    label="Matrix Access Token",
-    key="MATRIX_ACCESS_TOKEN",
-    type="password",
-    value=os.environ.get("MATRIX_ACCESS_TOKEN")
-)
-st.sidebar.text_input(
-    label="Matrix Device ID",
-    key="MATRIX_DEVICE_ID",
-    value=os.environ.get("MATRIX_DEVICE_ID")
-)
-st.sidebar.file_uploader(
-    label="Matrix Keys File",
-    type="txt",
-    key="MATRIX_KEYS_FILE"
-)
-st.sidebar.text_input(
-    label="Matrix Keys Passphrase",
-    key="MATRIX_KEYS_PASSPHRASE",
-    value=os.environ.get("MATRIX_KEYS_PASSPHRASE"),
-    type="password"
-)
-st.sidebar.text_area(
-    label="Matrix Room ID(s)",
-    key="MATRIX_ROOM_ID",
-    value=os.environ.get("MATRIX_ROOM_ID"),
-    help="Enter one or more room IDs, separated by new lines."
-)
-st.sidebar.number_input(
-    label="Citation Limit",
-    key="CITATION_LIMIT",
-    value=15,
-    min_value=1,
-)
+progress = st.empty()
 
-is_do_ingestion = st.sidebar.checkbox(
-    label="Do Ingestion",
-    value=True,
-)
+
+async def fetch_messages(room_id, len_room_ids):
+    matrix_client: AsyncClient = st.session_state["matrix_client"]
+    with progress:
+        st.session_state["progress_counter"] += 1
+        st.progress(st.session_state["progress_counter"] / len_room_ids)
+        st.text(f"Fetching {st.session_state["progress_counter"]}/{len_room_ids} room messages...")
+    room_messages_response = await matrix_client.room_messages(room_id=room_id, limit=sys.maxsize)
+    if isinstance(room_messages_response, RoomMessagesError):
+        raise Exception(f"Room messages fetch failed: {room_messages_response}")
+    return room_messages_response
+
+
+async def ingest_event(event: Event, len_events):
+    with progress:
+        st.session_state["progress_counter"] += 1
+        st.progress(st.session_state["progress_counter"] / len_events)
+        st.text(f"Ingesting {st.session_state["progress_counter"]}/{len_events} events...")
+
+    documents: List[Document] = await process_event(event)
+
+    document_ids = []
+    bytes_documents = []
+    vector_documents = []
+
+    for document in documents:
+        bytes_document = pickle.dumps(document)
+        vector_document = copy.deepcopy(document)
+        del vector_document.metadata["exclusion"]
+        bytes_documents.append(bytes_document)
+        vector_documents.append(vector_document)
+        document_ids.append(document.id)
+
+    if len(documents) > 0:
+        await file_store.amset(list(zip(document_ids, bytes_documents)))
+        if vector_store.col:
+            await vector_store.adelete(ids=document_ids)
+        await vector_store.aadd_documents(ids=document_ids, documents=vector_documents)
+
 
 if st.sidebar.button("Sync", use_container_width=True):
-    required_keys = [
-        "COHERE_API_KEY", "GOOGLE_API_KEY", "ZILLIZ_URI", "ZILLIZ_TOKEN",
-        "MATRIX_USER_ID", "MATRIX_ACCESS_TOKEN", "MATRIX_DEVICE_ID",
-        "MATRIX_KEYS_FILE", "MATRIX_KEYS_PASSPHRASE", "MATRIX_ROOM_ID",
-        "CITATION_LIMIT"
-    ]
-    if not all(st.session_state.get(k) for k in required_keys):
+    if matrix_keys_file is None:
         st.error("Configure first.")
     else:
-        matrix_client: AsyncClient = loop.run_until_complete(make_matrix_client())
-        st.session_state["matrix_client"] = matrix_client
-
-        embedder = CustomCohereEmbeddings(
-            model="embed-v4.0",
-            cohere_api_key=st.session_state["COHERE_API_KEY"]
-        )
-        generator_llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-pro-exp-03-25",
-            google_api_key=st.session_state["GOOGLE_API_KEY"]
-        )
-        vector_store = CustomMilvus(
-            embedding_function=embedder,
-            connection_args={"uri": st.session_state["ZILLIZ_URI"], "token": st.session_state["ZILLIZ_TOKEN"]},
-            collection_name="social_media_rag",
-            enable_dynamic_field=True,
-            index_params={"metric_type": "COSINE"},
-            search_params={"metric_type": "COSINE"},
-        )
-        vector_store._init()
-        file_store = LocalFileStore(root_path=store_path / "file_store")
-        st.session_state["embedder"] = embedder
-        st.session_state["generator_llm"] = generator_llm
-        st.session_state["file_store"] = file_store
-        st.session_state["vector_store"] = vector_store
-
-        graph = Graph()
-        graph.add_node("retrieve", retrieve)
-        graph.add_node("format_prompt", format_prompt)
-        graph.add_node("generate", generate)
-        graph.add_edge("retrieve", "format_prompt")
-        graph.add_edge("format_prompt", "generate")
-        graph.set_entry_point("retrieve")
-        graph.set_finish_point("generate")
-        qna_graph = graph.compile()
-        st.session_state["qna_graph"] = qna_graph
-
-        progress_bar = st.progress(0)
-        progress_text = st.text("Initializing...")
-        fetch_message_counter = 0
-        ingest_event_counter = 0
-        room_ids = st.session_state["MATRIX_ROOM_ID"].split("\n")
-
-
-        async def fetch_messages(room_id):
-            global fetch_message_counter
-            matrix_client: AsyncClient = st.session_state["matrix_client"]
-            fetch_message_counter += 1
-            progress_bar.progress(fetch_message_counter / len(room_ids))
-            progress_text.text(f"Fetching {fetch_message_counter}/{len(room_ids)} room messages...")
-            room_messages_response = await matrix_client.room_messages(room_id=room_id, limit=sys.maxsize)
-            if isinstance(room_messages_response, RoomMessagesError):
-                raise Exception(f"Room messages fetch failed: {room_messages_response}")
-            return room_messages_response
-
-
-        async def ingest_event(event: Event):
-            global ingest_event_counter
-            ingest_event_counter += 1
-            progress_bar.progress(ingest_event_counter / len(events))
-            progress_text.text(f"Ingesting {ingest_event_counter}/{len(events)} events...")
-            documents: List[Document] = await process_event(event)
-
-            document_ids = []
-            bytes_documents = []
-            vector_documents = []
-
-            for document in documents:
-                bytes_document = pickle.dumps(document)
-                vector_document = copy.deepcopy(document)
-                del vector_document.metadata["exclusion"]
-                bytes_documents.append(bytes_document)
-                vector_documents.append(vector_document)
-                document_ids.append(document.id)
-
-            if len(documents) > 0:
-                await file_store.amset(list(zip(document_ids, bytes_documents)))
-                if vector_store.col:
-                    await vector_store.adelete(ids=document_ids)
-                await vector_store.aadd_documents(ids=document_ids, documents=vector_documents)
-
-
+        st.session_state["matrix_client"] = loop.run_until_complete(make_matrix_client())
+        st.session_state["progress_counter"] = 0
+        room_ids = matrix_room_id.split("\n")
         stored_ids = list(file_store.yield_keys())
-        if is_do_ingestion:
-            fetch_tasks = [fetch_messages(room_id) for room_id in room_ids]
-            fetched_messages = loop.run_until_complete(asyncio.gather(*fetch_tasks))
-            events = [
-                event for fetched_message in fetched_messages for event in fetched_message.chunk
-                if isinstance(event, (RoomMessageText, RoomMessageMedia, RoomEncryptedMedia))
-                   and uuid.uuid5(uuid.NAMESPACE_OID, event.event_id) not in stored_ids
-            ]
-            ingest_tasks = [ingest_event(event) for event in events]
-            loop.run_until_complete(asyncio.gather(*ingest_tasks))
-
+        fetch_tasks = [fetch_messages(room_id, len(room_ids)) for room_id in room_ids]
+        fetched_messages = loop.run_until_complete(asyncio.gather(*fetch_tasks))
+        st.session_state["progress_counter"] = 0
+        events = [
+            event for fetched_message in fetched_messages for event in fetched_message.chunk
+            if isinstance(event, (RoomMessageText, RoomMessageMedia, RoomEncryptedMedia))
+               and uuid.uuid5(uuid.NAMESPACE_OID, event.event_id) not in stored_ids
+        ]
+        ingest_tasks = [ingest_event(event, len(events)) for event in events]
+        loop.run_until_complete(asyncio.gather(*ingest_tasks))
+        st.session_state["progress_counter"] = 0
         st.success("Sync successfully!")
 
 if st.sidebar.button("Reset", use_container_width=True):
-    required_keys = ["vector_store", "file_store"]
-    if not all(st.session_state.get(k) for k in required_keys):
-        st.error("Sync configuration first.")
-    else:
-        vector_store: CustomMilvus = st.session_state["vector_store"]
-        if vector_store.col:
-            vector_store.col.drop()
+    if vector_store.col:
+        vector_store.col.drop()
+    file_store.mdelete(keys=list(file_store.yield_keys()))
 
-        file_store: LocalFileStore = st.session_state["file_store"]
-        file_store.mdelete(keys=list(file_store.yield_keys()))
+    for key in st.session_state.keys():
+        del st.session_state[key]
 
-        for key in st.session_state.keys():
-            del st.session_state[key]
-
-        st.success("Reset successfully!")
-
-query = st.text_area("Ask a query:")
-if st.button("Submit"):
-    required_keys = [
-        "COHERE_API_KEY", "GOOGLE_API_KEY", "ZILLIZ_URI", "ZILLIZ_TOKEN",
-        "MATRIX_USER_ID", "MATRIX_ACCESS_TOKEN", "MATRIX_DEVICE_ID",
-        "MATRIX_KEYS_FILE", "MATRIX_KEYS_PASSPHRASE", "MATRIX_ROOM_ID",
-        "CITATION_LIMIT", "vector_store", "qna_graph"
-    ]
-    if not all(st.session_state.get(k) for k in required_keys):
-        st.error("Sync configuration first.")
-    else:
-        initial_state = {"query": query}
-        qna_graph: CompiledGraph = st.session_state["qna_graph"]
-        final_state = loop.run_until_complete(qna_graph.ainvoke(initial_state))
-        st.session_state["rag_result"] = final_state
+    st.success("Reset successfully!")
 
 
 @st.dialog(title="Citation Details", width="large")
@@ -491,12 +436,18 @@ def citation_details(document: Document):
     st.write(document.model_dump())
 
 
-if "rag_result" in st.session_state:
+query = st.text_area("Ask a query:")
+if st.button("Submit"):
+    initial_state = {"query": query}
+    final_state = loop.run_until_complete(qna_graph.ainvoke(initial_state))
+    st.session_state["qna_result"] = final_state
+
+if "qna_result" in st.session_state:
     st.markdown("**Response:**")
-    st.write(st.session_state["rag_result"]["response"])
+    st.write(st.session_state["qna_result"]["response"])
     st.markdown("**Citations:**")
-    if st.session_state["rag_result"]["documents"]:
-        for index, document in enumerate(st.session_state["rag_result"]["documents"]):
+    if len(st.session_state["qna_result"]["documents"]) > 0:
+        for index, document in enumerate(st.session_state["qna_result"]["documents"]):
             event_type = document.metadata["exclusion"]["event_type"]
             if st.button(label=f"Citation {index + 1}: {document.metadata['retrieval_score']}"):
                 citation_details(document)
@@ -514,4 +465,4 @@ if "rag_result" in st.session_state:
             else:
                 raise Exception(f"Unsupported mime type: {document}")
     else:
-        st.write("No citations available.")
+        st.write("No citations found.")
