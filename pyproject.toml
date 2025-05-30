@@ -2,13 +2,13 @@
 name = "social-media-rag"
 version = "0.1.0"
 description = "Add your description here"
-requires-python = ">=3.13"
+requires-python = ">=3.9,<3.14"
 dependencies = [
     "pydantic",
     "streamlit",
     "matrix-nio[e2e]",
     "graplit-python",
-    "langchain_community",
+    "langchain-community",
     "pdf2image",
     "langchain",
     "langgraph",
