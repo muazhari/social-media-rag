@@ -1,4 +1,4 @@
 .env
 .venv
-store
-__pycache__
+stores
+**/__pycache__
