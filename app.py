@@ -29,7 +29,7 @@ if "event_loop" not in st.session_state:
 
 loop = st.session_state["event_loop"]
 asyncio.set_event_loop(loop)
-store_path = Path("./store")
+store_path = Path("stores")
 store_path.mkdir(exist_ok=True)
 
 st.title("social-media-rag")
@@ -95,7 +95,7 @@ embedder = CustomCohereEmbeddings(
     cohere_api_key=cohere_api_key,
 )
 generator_llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-pro-exp-03-25",
+    model="gemini-2.5-pro",
     google_api_key=google_api_key,
 )
 vector_store = CustomMilvus(

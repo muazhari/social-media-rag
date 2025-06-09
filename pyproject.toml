@@ -22,6 +22,6 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 exclude = [
-    "encryption_keys",
+    "stores",
     "assets"
 ]
