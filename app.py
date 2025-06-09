@@ -29,7 +29,7 @@ if "event_loop" not in st.session_state:
 
 loop = st.session_state["event_loop"]
 asyncio.set_event_loop(loop)
-store_path = Path("./store")
+store_path = Path("stores")
 store_path.mkdir(exist_ok=True)
 
 st.title("social-media-rag")
