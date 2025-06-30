@@ -155,7 +155,7 @@ async def process_event(event: Event) -> List[Document]:
     matrix_client: AsyncClient = st.session_state["matrix_client"]
     if isinstance(event, RoomMessageText):
         document = Document(
-            id=uuid.uuid5(uuid.NAMESPACE_OID, event.event_id),
+            id=str(uuid.uuid5(uuid.NAMESPACE_OID, event.event_id)),
             page_content=event.body,
             metadata={
                 "exclusion": {
@@ -174,7 +174,7 @@ async def process_event(event: Event) -> List[Document]:
         if mime_type.startswith("image/"):
             b64_uri = f"data:{mime_type};base64,{base64.b64encode(download_response.body).decode('utf-8')}"
             document = Document(
-                id=uuid.uuid5(uuid.NAMESPACE_OID, event.event_id),
+                id=str(uuid.uuid5(uuid.NAMESPACE_OID, event.event_id)),
                 page_content=b64_uri,
                 metadata={
                     "exclusion": {
@@ -204,7 +204,7 @@ async def process_event(event: Event) -> List[Document]:
         if mime_type.startswith("image/"):
             b64_uri = f"data:{mime_type};base64,{base64.b64encode(decrypted_data).decode('utf-8')}"
             document = Document(
-                id=uuid.uuid5(uuid.NAMESPACE_OID, event.event_id),
+                id=str(uuid.uuid5(uuid.NAMESPACE_OID, event.event_id)),
                 page_content=b64_uri,
                 metadata={
                     "exclusion": {
@@ -413,7 +413,7 @@ if st.sidebar.button("Sync", use_container_width=True):
         events = [
             event for fetched_message in fetched_messages for event in fetched_message.chunk
             if isinstance(event, (RoomMessageText, RoomMessageMedia, RoomEncryptedMedia))
-               and uuid.uuid5(uuid.NAMESPACE_OID, event.event_id) not in stored_ids
+               and str(uuid.uuid5(uuid.NAMESPACE_OID, event.event_id)) not in stored_ids
         ]
         ingest_tasks = [ingest_event(event, len(events)) for event in events]
         loop.run_until_complete(asyncio.gather(*ingest_tasks))
