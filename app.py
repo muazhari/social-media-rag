@@ -1,11 +1,8 @@
 import asyncio
 import base64
 import copy
-import hashlib
-import io
 import os
 import pickle
-import sys
 import uuid
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -15,10 +12,11 @@ from langchain.storage import LocalFileStore
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, BaseMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.graph import Graph
+from langgraph.graph import StateGraph
 from nio import AsyncClient, RoomMessageText, RoomMessageMedia, SyncError, RoomMessagesError, \
     AsyncClientConfig, RoomEncryptedMedia, DownloadError, Event
 from nio.crypto import decrypt_attachment
+from pydantic import BaseModel
 
 from custom_cohere_embeddings import CustomCohereEmbeddings
 from custom_milvus import CustomMilvus
@@ -29,6 +27,7 @@ if "event_loop" not in st.session_state:
 
 loop = st.session_state["event_loop"]
 asyncio.set_event_loop(loop)
+
 store_path = Path("stores")
 store_path.mkdir(exist_ok=True)
 
@@ -74,12 +73,16 @@ matrix_keys_file = st.sidebar.file_uploader(
 matrix_keys_passphrase = st.sidebar.text_input(
     label="Matrix Keys Passphrase",
     value=os.environ.get("MATRIX_KEYS_PASSPHRASE"),
-    type="password"
+    type="password",
 )
 matrix_room_id = st.sidebar.text_area(
     label="Matrix Room ID(s)",
     value=os.environ.get("MATRIX_ROOM_ID"),
     help="Enter one or more room IDs, separated by new lines."
+)
+matrix_fetch_limit = st.sidebar.number_input(
+    label="Matrix Fetch Limit",
+    value=200,
 )
 collection_name = st.sidebar.text_input(
     label="Collection Name",
@@ -89,7 +92,6 @@ citation_limit = st.sidebar.number_input(
     label="Citation Limit",
     value=15,
 )
-
 embedder = CustomCohereEmbeddings(
     model="embed-v4.0",
     cohere_api_key=cohere_api_key,
@@ -125,24 +127,18 @@ async def make_matrix_client():
     )
 
     keys_file_path = store_path / "keys.txt"
-    current_keys_data = matrix_keys_file.getvalue()
-    current_keys_hash = hashlib.sha256(current_keys_data).hexdigest()
+    if not keys_file_path.exists():
+        if matrix_keys_file is None:
+            st.error("Configure Matrix Keys File first.")
+        else:
+            keys_data = matrix_keys_file.getvalue()
+            with open(keys_file_path, "wb") as f:
+                f.write(keys_data)
 
-    if keys_file_path.exists():
-        last_keys_file = io.FileIO(keys_file_path)
-        last_keys_data = last_keys_file.read()
-        last_keys_hash = hashlib.sha256(last_keys_data).hexdigest()
-    else:
-        last_keys_hash = None
-
-    if last_keys_hash != current_keys_hash:
-        with open(keys_file_path, "wb") as f:
-            f.write(current_keys_data)
-
-        await matrix_client.import_keys(
-            infile=str(keys_file_path),
-            passphrase=matrix_keys_passphrase,
-        )
+    await matrix_client.import_keys(
+        infile=str(keys_file_path),
+        passphrase=matrix_keys_passphrase,
+    )
 
     sync_response = await matrix_client.sync(full_state=True, timeout=30000)
     if isinstance(sync_response, SyncError):
@@ -224,10 +220,16 @@ async def process_event(event: Event) -> List[Document]:
         return []
 
 
-async def retrieve(state):
-    query: str = state["query"]
+class QNAState(BaseModel):
+    query: str = None
+    documents: List[Document] = None
+    prompt: HumanMessage = None
+    response: BaseMessage = None
+
+
+async def retrieve(state: QNAState) -> QNAState:
     retrieved_documents: List[Tuple[Document, float]] = await vector_store.asimilarity_search_with_score(
-        query=query,
+        query=state.query,
         k=citation_limit
     )
     cached_documents: List[Document] = []
@@ -237,7 +239,7 @@ async def retrieve(state):
         cached_document: Document = pickle.loads(bytes_cached_document)
         cached_document.metadata["retrieval_score"] = score
         cached_documents.append(cached_document)
-    state["documents"] = cached_documents
+    state.documents = cached_documents
     return state
 
 
@@ -296,12 +298,9 @@ async def get_citations(index, document) -> List[Dict]:
         raise Exception(f"Unsupported document type: {document}")
 
 
-async def format_prompt(state):
-    query: str = state["query"]
-    documents: List[Document] = state["documents"]
-
+async def format_prompt(state: QNAState) -> QNAState:
     citations = []
-    for index, document in enumerate(documents):
+    for index, document in enumerate(state.documents):
         citation = await get_citations(index + 1, document)
         citations.extend(citation)
 
@@ -336,26 +335,25 @@ async def format_prompt(state):
         },
     ]
     message = HumanMessage(content=message_content)
-    state["prompt"] = message
+    state.prompt = message
     return state
 
 
-async def generate(state):
-    prompt: HumanMessage = state["prompt"]
-    response: BaseMessage = await generator_llm.ainvoke([prompt])
-    state["response"] = response.content
+async def generate(state: QNAState) -> QNAState:
+    response: BaseMessage = await generator_llm.ainvoke([state.prompt])
+    state.response = response
     return state
 
 
-graph = Graph()
-graph.add_node("retrieve", retrieve)
-graph.add_node("format_prompt", format_prompt)
-graph.add_node("generate", generate)
-graph.add_edge("retrieve", "format_prompt")
-graph.add_edge("format_prompt", "generate")
-graph.set_entry_point("retrieve")
-graph.set_finish_point("generate")
-qna_graph = graph.compile()
+qna_graph = StateGraph(QNAState)
+qna_graph.add_node("retrieve", retrieve)
+qna_graph.add_node("format_prompt", format_prompt)
+qna_graph.add_node("generate", generate)
+qna_graph.add_edge("retrieve", "format_prompt")
+qna_graph.add_edge("format_prompt", "generate")
+qna_graph.set_entry_point("retrieve")
+qna_graph.set_finish_point("generate")
+qna_app = qna_graph.compile()
 
 progress = st.empty()
 
@@ -366,7 +364,7 @@ async def fetch_messages(room_id, len_room_ids):
         st.session_state["progress_counter"] += 1
         st.progress(st.session_state["progress_counter"] / len_room_ids)
         st.text(f"Fetching {st.session_state["progress_counter"]}/{len_room_ids} room messages...")
-    room_messages_response = await matrix_client.room_messages(room_id=room_id, limit=sys.maxsize)
+    room_messages_response = await matrix_client.room_messages(room_id=room_id, limit=matrix_fetch_limit)
     if isinstance(room_messages_response, RoomMessagesError):
         raise Exception(f"Room messages fetch failed: {room_messages_response}")
     return room_messages_response
@@ -400,25 +398,22 @@ async def ingest_event(event: Event, len_events):
 
 
 if st.sidebar.button("Sync", use_container_width=True):
-    if matrix_keys_file is None:
-        st.error("Configure first.")
-    else:
-        st.session_state["matrix_client"] = loop.run_until_complete(make_matrix_client())
-        st.session_state["progress_counter"] = 0
-        room_ids = matrix_room_id.split("\n")
-        stored_ids = list(file_store.yield_keys())
-        fetch_tasks = [fetch_messages(room_id, len(room_ids)) for room_id in room_ids]
-        fetched_messages = loop.run_until_complete(asyncio.gather(*fetch_tasks))
-        st.session_state["progress_counter"] = 0
-        events = [
-            event for fetched_message in fetched_messages for event in fetched_message.chunk
-            if isinstance(event, (RoomMessageText, RoomMessageMedia, RoomEncryptedMedia))
-               and str(uuid.uuid5(uuid.NAMESPACE_OID, event.event_id)) not in stored_ids
-        ]
-        ingest_tasks = [ingest_event(event, len(events)) for event in events]
-        loop.run_until_complete(asyncio.gather(*ingest_tasks))
-        st.session_state["progress_counter"] = 0
-        st.success("Sync successfully!")
+    st.session_state["matrix_client"] = loop.run_until_complete(make_matrix_client())
+    st.session_state["progress_counter"] = 0
+    room_ids = matrix_room_id.split("\n")
+    stored_ids = list(file_store.yield_keys())
+    fetch_tasks = [fetch_messages(room_id, len(room_ids)) for room_id in room_ids]
+    fetched_messages = loop.run_until_complete(asyncio.gather(*fetch_tasks))
+    st.session_state["progress_counter"] = 0
+    events = [
+        event for fetched_message in fetched_messages for event in fetched_message.chunk
+        if isinstance(event, (RoomMessageText, RoomMessageMedia, RoomEncryptedMedia))
+           and str(uuid.uuid5(uuid.NAMESPACE_OID, event.event_id)) not in stored_ids
+    ]
+    ingest_tasks = [ingest_event(event, len(events)) for event in events]
+    loop.run_until_complete(asyncio.gather(*ingest_tasks))
+    st.session_state["progress_counter"] = 0
+    st.success("Sync successfully!")
 
 if st.sidebar.button("Reset", use_container_width=True):
     if vector_store.col:
@@ -438,13 +433,15 @@ def citation_details(document: Document):
 
 query = st.text_area("Ask a query:")
 if st.button("Submit"):
-    initial_state = {"query": query}
-    final_state = loop.run_until_complete(qna_graph.ainvoke(initial_state))
+    initial_state = QNAState(
+        query=query,
+    )
+    final_state: QNAState = loop.run_until_complete(qna_app.ainvoke(initial_state))
     st.session_state["qna_result"] = final_state
 
 if "qna_result" in st.session_state:
     st.markdown("**Response:**")
-    st.write(st.session_state["qna_result"]["response"])
+    st.write(st.session_state["qna_result"]["response"].content)
     st.markdown("**Citations:**")
     if len(st.session_state["qna_result"]["documents"]) > 0:
         for index, document in enumerate(st.session_state["qna_result"]["documents"]):

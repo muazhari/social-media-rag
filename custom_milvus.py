@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import (
     Any,
     Callable,
@@ -18,12 +19,13 @@ from typing import (
 import numpy as np
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from langchain_milvus import Milvus
+from langchain_core.vectorstores import VectorStore
 from langchain_milvus.function import BaseMilvusBuiltInFunction, BM25BuiltInFunction
 from langchain_milvus.utils.constant import PRIMARY_FIELD, VECTOR_FIELD
 from langchain_milvus.utils.sparse import BaseSparseEmbedding
 from pymilvus import (
     AnnSearchRequest,
+    AsyncMilvusClient,
     Collection,
     CollectionSchema,
     DataType,
@@ -32,7 +34,6 @@ from pymilvus import (
     MilvusClient,
     MilvusException,
     RRFRanker,
-    SearchResult,
     WeightedRanker,
     utility,
 )
@@ -146,7 +147,7 @@ EmbeddingType = Union[Embeddings, BaseSparseEmbedding]
 T = TypeVar("T")
 
 
-class CustomMilvus(Milvus):
+class CustomMilvus(VectorStore):
     """Milvus vector store integration.
 
     Setup:
@@ -275,6 +276,7 @@ class CustomMilvus(Milvus):
             enable_dynamic_field: bool = False,
             metadata_field: Optional[str] = None,
             partition_key_field: Optional[str] = None,
+            num_partitions: Optional[int] = None,
             partition_names: Optional[list] = None,
             replica_number: int = 1,
             timeout: Optional[float] = None,
@@ -338,6 +340,7 @@ class CustomMilvus(Milvus):
         self.search_params = search_params
         self.consistency_level = consistency_level
         self.auto_id = auto_id
+        self.num_partitions = num_partitions
 
         # In order for a collection to be compatible, pk needs to be varchar
         self._primary_field = primary_field
@@ -366,9 +369,31 @@ class CustomMilvus(Milvus):
         # Create the connection to the server
         if connection_args is None:
             connection_args = DEFAULT_MILVUS_CONNECTION
+
+        # Store connection args for potential async client creation
+        self._connection_args = connection_args
+
         self._milvus_client = MilvusClient(
             **connection_args,
         )
+
+        # Safely create AsyncMilvusClient to avoid failures in multithreading
+        # environments
+        try:
+            self._async_milvus_client = AsyncMilvusClient(
+                **connection_args,
+            )
+        except Exception as e:
+            # If creation fails (e.g., no event loop in multithreading
+            # environment), set to None. This won't affect Milvus instance
+            # creation, async operations will only fail when actually needed
+            logger.warning(
+                f"Failed to initialize AsyncMilvusClient during Milvus "
+                f"initialization: {e}. Async operations will be unavailable "
+                f"until AsyncMilvusClient is successfully created."
+            )
+            self._async_milvus_client = None
+
         self.alias = self.client._using
 
         self.col: Optional[Collection] = None
@@ -550,6 +575,62 @@ class CustomMilvus(Milvus):
         return self._milvus_client
 
     @property
+    def aclient(self) -> AsyncMilvusClient:
+        """Get async client."""
+        if self._async_milvus_client is None:
+            # Try to create AsyncMilvusClient in current environment
+            try:
+                import asyncio
+                import threading
+
+                # Check current thread environment
+                current_thread = threading.current_thread()
+                is_main_thread = current_thread is threading.main_thread()
+
+                try:
+                    # Try to get current event loop
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running() and not is_main_thread:
+                        # In non-main thread with running loop, create directly
+                        self._async_milvus_client = AsyncMilvusClient(
+                            **self._connection_args
+                        )
+                    elif not loop.is_running():
+                        # Loop exists but not running, set it as current thread's loop
+                        asyncio.set_event_loop(loop)
+                        self._async_milvus_client = AsyncMilvusClient(
+                            **self._connection_args
+                        )
+                    else:
+                        # Other cases, create directly
+                        self._async_milvus_client = AsyncMilvusClient(
+                            **self._connection_args
+                        )
+                except RuntimeError:
+                    # No event loop, create a new one
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    self._async_milvus_client = AsyncMilvusClient(
+                        **self._connection_args
+                    )
+
+            except Exception as e:
+                # If still fails, raise clear error message
+                raise RuntimeError(
+                    f"Failed to create AsyncMilvusClient: {e}. "
+                    f"This usually happens in multithreading environments "
+                    f"(like Streamlit) where event loops are not properly "
+                    f"configured. To fix this issue, you can: "
+                    f"1. Use only synchronous methods (avoid methods "
+                    f"starting with 'a') "
+                    f"2. Create the Milvus instance in the main thread "
+                    f"3. Or ensure proper asyncio event loop setup in your "
+                    f"environment."
+                ) from e
+
+        return self._async_milvus_client
+
+    @property
     def vector_fields(self) -> List[str]:
         """Get vector field(s)."""
         return self._as_list(self._vector_field)
@@ -654,6 +735,7 @@ class CustomMilvus(Milvus):
                     consistency_level=self.consistency_level,
                     using=self.alias,
                     num_shards=self.num_shards,
+                    num_partitions=self.num_partitions,
                 )
             else:
                 self.col = Collection(
@@ -661,6 +743,7 @@ class CustomMilvus(Milvus):
                     schema=schema,
                     consistency_level=self.consistency_level,
                     using=self.alias,
+                    num_partitions=self.num_partitions,
                 )
             # Set the collection properties if they exist
             if self.collection_properties is not None:
@@ -735,6 +818,7 @@ class CustomMilvus(Milvus):
                         # Datatype is a string/varchar equivalent
                         elif dtype == DataType.VARCHAR:
                             kwargs = {}
+
                             fields.append(
                                 FieldSchema(
                                     key, DataType.VARCHAR, max_length=65_535, **kwargs
@@ -1001,6 +1085,65 @@ class CustomMilvus(Milvus):
                 timeout=timeout,
             )
 
+    def _prepare_insert_list(
+            self,
+            texts: List[str],
+            embeddings: List[List[float]] | List[List[List[float]]],
+            metadatas: Optional[List[dict]] = None,
+            ids: Optional[List[str]] = None,
+            force_ids: bool = False,
+    ) -> list[dict]:
+        """Prepare insert list for batch insertion.
+
+        Args:
+            texts: List of texts to insert
+            embeddings: List of embeddings corresponding to the texts
+            metadatas: Optional metadata for each text
+            ids: Optional IDs for each text
+            force_ids: If force_ids, when auto_id is True and ids is not None,
+             it will return a list containing the customized ids, otherwise,
+             it will not contain the customized ids.
+
+        Returns:
+            List of dictionaries ready for insertion
+        """
+        insert_list: list[dict] = []
+
+        for vector_field_embeddings in embeddings:
+            assert len(texts) == len(
+                vector_field_embeddings
+            ), "Mismatched lengths of texts and embeddings."
+
+        if metadatas is not None:
+            assert len(texts) == len(
+                metadatas
+            ), "Mismatched lengths of texts and metadatas."
+
+        for i, text in zip(range(len(texts)), texts):
+            entity_dict = {}
+            metadata = metadatas[i] if metadatas else {}
+            if not self.auto_id or force_ids:
+                entity_dict[self._primary_field] = ids[i]  # type: ignore[index]
+
+            for vector_field, vector_field_embeddings in zip(  # type: ignore
+                    self._vector_fields_from_embedding, embeddings
+            ):
+                entity_dict[vector_field] = vector_field_embeddings[i]
+
+            if self._metadata_field and not self.enable_dynamic_field:
+                entity_dict[self._metadata_field] = metadata
+            else:
+                for key, value in metadata.items():
+                    # if not enable_dynamic_field, skip fields not in the collection.
+                    if not self.enable_dynamic_field and key not in self.fields:
+                        continue
+                    # If enable_dynamic_field, all fields are allowed.
+                    entity_dict[key] = value
+
+            insert_list.append(entity_dict)
+
+        return insert_list
+
     def add_texts(
             self,
             texts: Iterable[str],
@@ -1039,12 +1182,14 @@ class CustomMilvus(Milvus):
             List[str]: The resulting keys for each inserted element.
         """
         texts = list(texts)
-        if not self.auto_id:
-            assert isinstance(ids, list), (
-                "A list of valid ids are required when auto_id is False. "
-                "You can set `auto_id` to True in this Milvus instance to generate "
-                "ids automatically, or specify string-type ids for each text."
+        if not self.auto_id and ids is None:
+            warnings.warn(
+                "No ids provided and auto_id is False. "
+                "Setting auto_id to True automatically.",
+                UserWarning,
             )
+            self.auto_id = True
+        elif not self.auto_id and ids:  # Check ids
             assert len(set(ids)) == len(
                 texts
             ), "Different lengths of texts and unique ids are provided."
@@ -1053,12 +1198,11 @@ class CustomMilvus(Milvus):
                 len(x.encode()) <= 65_535 for x in ids
             ), "Each id should be a string less than 65535 bytes."
 
-        else:
-            if ids is not None:
-                logger.warning(
-                    "The ids parameter is ignored when auto_id is True. "
-                    "The ids will be generated automatically."
-                )
+        elif self.auto_id and ids:
+            logger.warning(
+                "The ids parameter is ignored when auto_id is True. "
+                "The ids will be generated automatically."
+            )
 
         embeddings_functions: List[EmbeddingType] = self._as_list(self.embedding_func)
         embeddings: List = []
@@ -1183,40 +1327,12 @@ class CustomMilvus(Milvus):
                 kwargs["timeout"] = self.timeout
             self._init(**kwargs)
 
-        insert_list: list[dict] = []
-
-        for vector_field_embeddings in embeddings:
-            assert len(texts) == len(
-                vector_field_embeddings
-            ), "Mismatched lengths of texts and embeddings."
-
-        if metadatas is not None:
-            assert len(texts) == len(
-                metadatas
-            ), "Mismatched lengths of texts and metadatas."
-
-        for i, text in zip(range(len(texts)), texts):
-            entity_dict = {}
-            metadata = metadatas[i] if metadatas else {}
-            if not self.auto_id:
-                entity_dict[self._primary_field] = ids[i]  # type: ignore[index]
-
-            for vector_field, vector_field_embeddings in zip(  # type: ignore
-                    self._vector_fields_from_embedding, embeddings
-            ):
-                entity_dict[vector_field] = vector_field_embeddings[i]
-
-            if self._metadata_field and not self.enable_dynamic_field:
-                entity_dict[self._metadata_field] = metadata
-            else:
-                for key, value in metadata.items():
-                    # if not enable_dynamic_field, skip fields not in the collection.
-                    if not self.enable_dynamic_field and key not in self.fields:
-                        continue
-                    # If enable_dynamic_field, all fields are allowed.
-                    entity_dict[key] = value
-
-            insert_list.append(entity_dict)
+        insert_list = self._prepare_insert_list(
+            texts=texts,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            ids=ids,
+        )
 
         # Total insert count
         total_count = len(insert_list)
@@ -1230,29 +1346,57 @@ class CustomMilvus(Milvus):
             batch_insert_list = insert_list[i:end]
             # Insert into the collection.
             try:
-                res: Collection
                 timeout = self.timeout or timeout
-                res = self.col.insert(batch_insert_list, timeout=timeout, **kwargs)
-                pks.extend(res.primary_keys)
-            except MilvusException as e:
-                first_entity = {}
-                if batch_insert_list:
-                    first_entity = batch_insert_list[0]
-                log_entity = {}
-                for k, v in first_entity.items():
-                    if isinstance(v, list) and len(v) > 10:
-                        log_entity[k] = f"{v[:10]}... (truncated, total len: {len(v)})"
-                    else:
-                        log_entity[k] = v
-                logger.error(
-                    "Failed to insert batch starting at entity: %s/%s. "
-                    "First entity data: %s",
-                    i + 1,
-                    total_count,
-                    log_entity,
+                res = self.client.insert(
+                    self.collection_name,
+                    batch_insert_list,
+                    timeout=timeout,
+                    **kwargs,
                 )
-                raise e
+                pks.extend(res["ids"])
+            except MilvusException as e:
+                self._handle_batch_operation_exception(
+                    e, batch_insert_list, i, total_count, "insert"
+                )
         return pks
+
+    def _handle_batch_operation_exception(
+            self,
+            e: MilvusException,
+            batch_list: list[dict],
+            batch_index: int,
+            total_count: int,
+            operation_name: str,
+    ) -> None:
+        """Handle batch operation exceptions with detailed logging.
+
+        Args:
+            e: The MilvusException that occurred
+            batch_list: The batch list that caused the exception
+            batch_index: Current batch index (0-based)
+            total_count: Total number of entities
+            operation_name: Name of the operation (e.g., "insert", "upsert")
+
+        Raises:
+            MilvusException: Re-raises the original exception after logging
+        """
+        first_entity = {}
+        if batch_list:
+            first_entity = batch_list[0]
+        log_entity = {}
+        for k, v in first_entity.items():
+            if isinstance(v, list) and len(v) > 10:
+                log_entity[k] = f"{v[:10]}... (truncated, total len: {len(v)})"
+            else:
+                log_entity[k] = v
+        logger.error(
+            "Failed to %s batch starting at entity: %s/%s. " "First entity data: %s",
+            operation_name,
+            batch_index + 1,
+            total_count,
+            log_entity,
+        )
+        raise e
 
     def _collection_search(
             self,
@@ -1262,7 +1406,7 @@ class CustomMilvus(Milvus):
             expr: Optional[str] = None,
             timeout: Optional[float] = None,
             **kwargs: Any,
-    ) -> Optional[SearchResult]:
+    ) -> Optional[List[List[dict]]]:
         """Perform a search on an embedding or a query text and return milvus search
         results.
 
@@ -1282,7 +1426,7 @@ class CustomMilvus(Milvus):
             kwargs: Collection.search() keyword arguments.
 
         Returns:
-            pymilvus.client.abstract.SearchResult: Milvus search result.
+            List[List[dict]]: Milvus search result.
         """
         if self.col is None:
             logger.debug("No existing collection to search.")
@@ -1304,12 +1448,13 @@ class CustomMilvus(Milvus):
             output_fields = ["*"]
         else:
             output_fields = self._remove_forbidden_fields(self.fields[:])
-        col_search_res = self.col.search(
+        col_search_res = self.client.search(
+            self.collection_name,
             data=[embedding_or_text],
             anns_field=self._vector_field,
-            param=param,
+            search_params=param,
             limit=k,
-            expr=expr,
+            filter=expr,
             output_fields=output_fields,
             timeout=self.timeout or timeout,
             **kwargs,
@@ -1327,7 +1472,7 @@ class CustomMilvus(Milvus):
             ranker_params: Optional[dict] = None,
             timeout: Optional[float] = None,
             **kwargs: Any,
-    ) -> Optional[SearchResult]:
+    ) -> Optional[List[List[dict]]]:
         """
         Perform a hybrid search on a query string and return milvus search results.
 
@@ -1351,7 +1496,7 @@ class CustomMilvus(Milvus):
             kwargs: Collection.hybrid_search() keyword arguments.
 
         Returns:
-            pymilvus.client.abstract.SearchResult: Milvus search result.
+            List[List[dict]]: Milvus search result.
         """
         if self.col is None:
             logger.debug("No existing collection to search.")
@@ -1396,9 +1541,10 @@ class CustomMilvus(Milvus):
             output_fields = ["*"]
         else:
             output_fields = self._remove_forbidden_fields(self.fields[:])
-        col_search_res = self.col.hybrid_search(
+        col_search_res = self.client.hybrid_search(
+            self.collection_name,
             reqs=search_requests,
-            rerank=reranker,
+            ranker=reranker,
             limit=k,
             output_fields=output_fields,
             timeout=self.timeout or timeout,
@@ -1693,14 +1839,14 @@ class CustomMilvus(Milvus):
         documents = []
         scores = []
         for result in col_search_res[0]:
-            data = {x: result.entity.get(x) for x in result.entity.fields}
-            doc = self._parse_document(data)
+            doc = self._parse_document(result["entity"])
             documents.append(doc)
-            scores.append(result.score)
-            ids.append(result.id)
+            scores.append(result["distance"])
+            ids.append(result.get(self._primary_field, "id"))
 
-        vectors = self.col.query(  # type: ignore[union-attr]
-            expr=f"{self._primary_field} in {ids}",
+        vectors = self.client.query(
+            self.collection_name,
+            filter=f"{self._primary_field} in {ids}",
             output_fields=[self._primary_field, self._vector_field],
             timeout=timeout,
         )
@@ -1793,9 +1939,9 @@ class CustomMilvus(Milvus):
                 f" for metric type: {metric_type}."
             )
 
-    def delete(  # type: ignore[no-untyped-def]
+    def delete(
             self, ids: Optional[List[str]] = None, expr: Optional[str] = None, **kwargs: str
-    ):
+    ) -> Optional[bool]:
         """Delete by vector ID or boolean expression.
         Refer to [Milvus documentation](https://milvus.io/docs/delete_data.md)
         for notes and examples of expressions.
@@ -1804,6 +1950,10 @@ class CustomMilvus(Milvus):
             ids: List of ids to delete.
             expr: Boolean expression that specifies the entities to delete.
             kwargs: Other parameters in Milvus delete api.
+
+        Returns:
+            Optional[bool]: True if deletion is successful,
+            False otherwise.
         """
         if isinstance(ids, list) and len(ids) > 0:
             if expr is not None:
@@ -1815,7 +1965,14 @@ class CustomMilvus(Milvus):
             assert isinstance(
                 expr, str
             ), "Either ids list or expr string must be provided."
-        return self.col.delete(expr=expr, **kwargs)  # type: ignore[union-attr]
+        try:
+            self.client.delete(self.collection_name, filter=expr, **kwargs)
+            return True
+        except MilvusException as e:
+            logger.error(
+                "Failed to delete entities: %s error: %s", self.collection_name, e
+            )
+            return False
 
     @classmethod
     def from_texts(
@@ -1836,7 +1993,7 @@ class CustomMilvus(Milvus):
                 Union[BaseMilvusBuiltInFunction, List[BaseMilvusBuiltInFunction]]
             ] = None,
             **kwargs: Any,
-    ) -> Milvus:
+    ) -> CustomMilvus:
         """Create a Milvus collection, indexes it with HNSW, and insert data.
 
         Args:
@@ -1904,15 +2061,14 @@ class CustomMilvus(Milvus):
 
     def _parse_documents_from_search_results(
             self,
-            col_search_res: SearchResult,
+            col_search_res: Optional[List[List[dict]]],
     ) -> List[Tuple[Document, float]]:
         if not col_search_res:
             return []
         ret = []
         for result in col_search_res[0]:
-            data = {x: result.entity.get(x) for x in result.entity.fields}
-            doc = self._parse_document(data)
-            pair = (doc, result.score)
+            doc = self._parse_document(result["entity"])
+            pair = (doc, result["distance"])
             ret.append(pair)
         return ret
 
@@ -1925,7 +2081,6 @@ class CustomMilvus(Milvus):
         Returns:
             List of IDs of the added texts.
         """
-        # TODO: Handle the case where the user doesn't provide ids on the Collection
         texts = [doc.page_content for doc in documents]
         metadatas = [doc.metadata for doc in documents]
         return self.add_texts(texts, metadatas, **kwargs)
@@ -1945,8 +2100,10 @@ class CustomMilvus(Milvus):
             return None
 
         try:
-            query_result = self.col.query(
-                expr=expr, output_fields=[self._primary_field]
+            query_result = self.client.query(
+                self.collection_name,
+                filter=expr,
+                output_fields=[self._primary_field],
             )
         except MilvusException as exc:
             logger.error("Failed to get ids: %s error: %s", self.collection_name, exc)
@@ -1958,34 +2115,69 @@ class CustomMilvus(Milvus):
             self,
             ids: Optional[List[str]] = None,
             documents: List[Document] | None = None,
+            batch_size: int = 1000,
+            timeout: Optional[float] = None,
             **kwargs: Any,
-    ) -> List[str] | None:
+    ) -> None:
         """Update/Insert documents to the vectorstore.
 
         Args:
             ids: IDs to update - Let's call get_pks to get ids with expression \n
             documents (List[Document]): Documents to add to the vectorstore.
 
-        Returns:
-            List[str]: IDs of the added texts.
         """
 
         if documents is None or len(documents) == 0:
             logger.debug("No documents to upsert.")
-            return None
+            return
 
-        if ids is not None and len(ids):
+        if not ids:
+            self.add_documents(documents=documents, **kwargs)
+        else:
+            assert len(set(ids)) == len(
+                documents
+            ), "Different lengths of documents and unique ids are provided."
+
+        embeddings_functions: List[EmbeddingType] = self._as_list(self.embedding_func)
+        embeddings: List = []
+        texts = [doc.page_content for doc in documents]
+        metadatas = [doc.metadata for doc in documents]
+        for embedding_func in embeddings_functions:
             try:
-                self.delete(ids=ids)
-            except MilvusException:
-                pass
-        try:
-            return self.add_documents(documents=documents, **kwargs)
-        except MilvusException as exc:
-            logger.error(
-                "Failed to upsert entities: %s error: %s", self.collection_name, exc
-            )
-            raise exc
+                embeddings.append(embedding_func.embed_documents(texts))
+            except NotImplementedError:
+                embeddings.append([embedding_func.embed_query(x) for x in texts])
+
+        upsert_list = self._prepare_insert_list(
+            texts=texts,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            ids=ids,
+            force_ids=True,
+        )
+
+        # Total upsert count
+        total_count = len(upsert_list)
+
+        assert isinstance(self.col, Collection)
+        for i in range(0, total_count, batch_size):
+            # Grab end index
+            end = min(i + batch_size, total_count)
+            batch_upsert_list = upsert_list[i:end]
+            # Upsert into the collection.
+            try:
+                timeout = self.timeout or timeout
+                self.client.upsert(
+                    self.collection_name,
+                    batch_upsert_list,
+                    timeout=timeout,
+                    **kwargs,
+                )
+            except MilvusException as e:
+                self._handle_batch_operation_exception(
+                    e, batch_upsert_list, i, total_count, "upsert"
+                )
+        return
 
     @staticmethod
     def _as_list(value: Optional[Union[T, List[T]]]) -> List[T]:
@@ -2068,7 +2260,939 @@ class CustomMilvus(Milvus):
             fields = self.fields
 
         try:
-            results = self.col.query(expr=expr, output_fields=fields, limit=limit)
+            results = self.client.query(
+                self.collection_name,
+                filter=expr,
+                output_fields=fields,
+                limit=limit,
+            )
+            return [
+                Document(page_content="", metadata=result)
+                for result in results
+            ]
+        except MilvusException as e:
+            logger.error(f"Metadata search failed: {e}")
+            return []
+
+    async def aadd_texts(
+            self,
+            texts: Iterable[str],
+            metadatas: Optional[List[dict]] = None,
+            timeout: Optional[float] = None,
+            batch_size: int = 1000,
+            *,
+            ids: Optional[List[str]] = None,
+            **kwargs: Any,
+    ) -> List[str]:
+        """Insert text data into Milvus asynchronously.
+
+        Inserting data when the collection has not be made yet will result
+        in creating a new Collection. The data of the first entity decides
+        the schema of the new collection, the dim is extracted from the first
+        embedding and the columns are decided by the first metadata dict.
+        Metadata keys will need to be present for all inserted values. At
+        the moment there is no None equivalent in Milvus.
+
+        Args:
+            texts (Iterable[str]): The texts to embed, it is assumed
+                that they all fit in memory.
+            metadatas (Optional[List[dict]]): Metadata dicts attached to each of
+                the texts. Defaults to None.
+            should be less than 65535 bytes. Required and work when auto_id is False.
+            timeout (Optional[float]): Timeout for each batch insert. Defaults
+                to None.
+            batch_size (int, optional): Batch size to use for insertion.
+                Defaults to 1000.
+            ids (Optional[List[str]]): List of text ids. The length of each item
+
+        Raises:
+            MilvusException: Failure to add texts
+
+        Returns:
+            List[str]: The resulting keys for each inserted element.
+        """
+        texts = list(texts)
+        if not self.auto_id and ids is None:
+            warnings.warn(
+                "No ids provided and auto_id is False. "
+                "Setting auto_id to True automatically.",
+                UserWarning,
+            )
+            self.auto_id = True
+        elif not self.auto_id and ids:  # Check ids
+            assert len(set(ids)) == len(
+                texts
+            ), "Different lengths of texts and unique ids are provided."
+
+        elif self.auto_id and ids:
+            logger.warning(
+                "The ids parameter is ignored when auto_id is True. "
+                "The ids will be generated automatically."
+            )
+
+        embeddings_functions: List[EmbeddingType] = self._as_list(self.embedding_func)
+        embeddings: List = []
+
+        for embedding_func in embeddings_functions:
+            try:
+                embeddings.append(await embedding_func.aembed_documents(texts))
+            except NotImplementedError:
+                embeddings.append([await embedding_func.aembed_query(x) for x in texts])
+
+        if len(texts) == 0:
+            logger.debug("Nothing to insert, skipping.")
+            return []
+
+        # Transpose it into row-wise
+        if self._is_multi_embedding:
+            transposed_embeddings = [
+                [embeddings[j][i] for j in range(len(embeddings))]
+                for i in range(len(embeddings[0]))
+            ]
+        else:
+            transposed_embeddings = embeddings[0] if len(embeddings) > 0 else []
+
+        return await self.aadd_embeddings(
+            texts=texts,
+            embeddings=transposed_embeddings,
+            metadatas=metadatas,
+            timeout=timeout,
+            batch_size=batch_size,
+            ids=ids,
+            **kwargs,
+        )
+
+    async def aadd_embeddings(
+            self,
+            texts: List[str],
+            embeddings: List[List[float]] | List[List[List[float]]],
+            metadatas: Optional[List[dict]] = None,
+            timeout: Optional[float] = None,
+            batch_size: int = 1000,
+            *,
+            ids: Optional[List[str]] = None,
+            **kwargs: Any,
+    ) -> List[str]:
+        """Insert text data with embeddings vectors into Milvus asynchronously.
+
+        This method inserts a batch of text embeddings into a Milvus collection.
+        If the collection is not initialized, it will automatically initialize
+        the collection based on the embeddings,metadatas, and other parameters.
+        The embeddings are expected to be pre-generated using compatible embedding
+        functions, and the metadata associated with each text is optional but
+        must match the number of texts.
+
+        Args:
+            texts (List[str]): the texts to insert
+            embeddings (List[List[float]] | List[List[List[float]]]):
+                A vector embeddings for each text (in case of a single vector)
+                or list of vectors for each text (in case of multi-vector)
+            metadatas (Optional[List[dict]]): Metadata dicts attached to each of
+                the texts. Defaults to None.
+            should be less than 65535 bytes. Required and work when auto_id is False.
+            timeout (Optional[float]): Timeout for each batch insert. Defaults
+                to None.
+            batch_size (int, optional): Batch size to use for insertion.
+                Defaults to 1000.
+            ids (Optional[List[str]]): List of text ids. The length of each item
+
+        Raises:
+            MilvusException: Failure to add texts and embeddings
+
+        Returns:
+            List[str]: The resulting keys for each inserted element.
+        """
+
+        if embeddings:
+            # row-wise -> field-wise
+            if not self._is_multi_embedding:
+                embeddings = [[embedding] for embedding in embeddings]  # type: ignore
+            # Transpose embeddings to make it a list of embeddings of each type.
+            embeddings = [  # type: ignore
+                [embeddings[j][i] for j in range(len(embeddings))]
+                for i in range(len(embeddings[0]))
+            ]
+
+        # If the collection hasn't been initialized yet, perform all steps to do so
+        if not isinstance(self.col, Collection):
+            kwargs = {"embeddings": embeddings, "metadatas": metadatas}
+            if self.partition_names:
+                kwargs["partition_names"] = self.partition_names
+            if self.replica_number:
+                kwargs["replica_number"] = self.replica_number
+            if self.timeout:
+                kwargs["timeout"] = self.timeout
+            self._init(**kwargs)
+
+        insert_list = self._prepare_insert_list(
+            texts=texts,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            ids=ids,
+        )
+
+        # Total insert count
+        total_count = len(insert_list)
+
+        pks: list[str] = []
+
+        assert isinstance(self.col, Collection)
+        for i in range(0, total_count, batch_size):
+            # Grab end index
+            end = min(i + batch_size, total_count)
+            batch_insert_list = insert_list[i:end]
+            # Insert into the collection.
+            try:
+                timeout = self.timeout or timeout
+                res = await self.aclient.insert(
+                    self.collection_name,
+                    batch_insert_list,
+                    timeout=timeout,
+                    **kwargs,
+                )
+                pks.extend(res["ids"])
+            except MilvusException as e:
+                self._handle_batch_operation_exception(
+                    e, batch_insert_list, i, total_count, "insert"
+                )
+        return pks
+
+    async def _acollection_search(
+            self,
+            embedding_or_text: List[float] | Dict[int, float] | str,
+            k: int = 4,
+            param: Optional[dict] = None,
+            expr: Optional[str] = None,
+            timeout: Optional[float] = None,
+            **kwargs: Any,
+    ) -> Optional[List[List[dict]]]:
+        """Perform an async search on an embedding or a query text and return milvus
+        search results.
+
+        For more information about the search parameters, take a look at the pymilvus
+        documentation found here:
+        https://milvus.io/api-reference/pymilvus/v2.5.x/ORM/Collection/search.md
+
+        Args:
+            embedding_or_text (List[float] | Dict[int, float] | str): The embedding
+                vector or query text being searched.
+            k (int, optional): The amount of results to return. Defaults to 4.
+            param (dict): The search params for the specified index.
+                Defaults to None.
+            expr (str, optional): Filtering expression. Defaults to None.
+            timeout (float, optional): How long to wait before timeout error.
+                Defaults to None.
+            kwargs: Collection.search() keyword arguments.
+
+        Returns:
+            List[List[dict]]: Milvus search result.
+        """
+        if self.col is None:
+            logger.debug("No existing collection to search.")
+            return None
+
+        assert not self._is_multi_vector, (
+            "_acollection_search does not support multi-vector search. "
+            "You can use _acollection_hybrid_search instead."
+        )
+
+        if param is None:
+            assert len(self._as_list(self.search_params)) == 1, (
+                "The number of search params is larger than 1, "
+                "please check the search_params in this Milvus instance."
+            )
+            param = self._as_list(self.search_params)[0]
+
+        if self.enable_dynamic_field:
+            output_fields = ["*"]
+        else:
+            output_fields = self._remove_forbidden_fields(self.fields[:])
+        col_search_res = await self.aclient.search(
+            self.collection_name,
+            data=[embedding_or_text],
+            anns_field=self._vector_field,
+            search_params=param,
+            limit=k,
+            filter=expr,
+            output_fields=output_fields,
+            timeout=self.timeout or timeout,
+            **kwargs,
+        )
+        return col_search_res
+
+    async def _acollection_hybrid_search(
+            self,
+            query: str,
+            k: int = 4,
+            param: Optional[dict | list[dict]] = None,
+            expr: Optional[str] = None,
+            fetch_k: Optional[int] = 4,
+            ranker_type: Optional[Literal["rrf", "weighted"]] = None,
+            ranker_params: Optional[dict] = None,
+            timeout: Optional[float] = None,
+            **kwargs: Any,
+    ) -> Optional[List[List[dict]]]:
+        """
+        Perform an async hybrid search on a query string and return milvus search
+        results.
+
+        For more information about the search parameters, take a look at the pymilvus
+        documentation found here:
+        https://milvus.io/api-reference/pymilvus/v2.5.x/ORM/Collection/hybrid_search.md
+
+        Args:
+            query (str): The text being searched.
+            k (int, optional): The amount of results to return. Defaults to 4.
+            param (dict | list[dict], optional): The search params for the specified
+                index. Defaults to None.
+            expr (str, optional): Filtering expression. Defaults to None.
+            fetch_k (int, optional): The amount of pre-fetching results for each query.
+                Defaults to 4.
+            ranker_type (str, optional): The type of ranker to use. Defaults to None.
+            ranker_params (dict, optional): The parameters for the ranker.
+                Defaults to None.
+            timeout (float, optional): How long to wait before timeout error.
+                Defaults to None.
+            kwargs: Collection.hybrid_search() keyword arguments.
+
+        Returns:
+            List[List[dict]]: Milvus search result.
+        """
+        if self.col is None:
+            logger.debug("No existing collection to search.")
+            return None
+
+        search_requests = []
+        reranker = self._create_ranker(
+            ranker_type=ranker_type,
+            ranker_params=ranker_params or {},
+        )
+        if not param:
+            param_list = self._as_list(self.search_params)
+        else:
+            assert len(self._as_list(param)) == len(
+                self._as_list(self.search_params)
+            ), (
+                f"The number of search params ({len(self._as_list(param))})"
+                f" does not match the number of vector fields "
+                f"({len(self._as_list(self._vector_field))})."
+                f" All vector fields are: {(self._as_list(self._vector_field))},"
+                " please provide a list of search params for each vector field."
+            )
+            param_list = self._as_list(param)
+        for field, param_dict in zip(self._vector_field, param_list):
+            search_data: List[float] | Dict[int, float] | str
+            if field in self._vector_fields_from_embedding:
+                embedding_func: EmbeddingType = self._as_list(self.embedding_func)[  # type: ignore
+                    self._vector_fields_from_embedding.index(field)
+                ]
+                search_data = await embedding_func.aembed_query(query)
+            else:
+                search_data = query
+            request = AnnSearchRequest(
+                data=[search_data],
+                anns_field=field,
+                param=param_dict,
+                limit=fetch_k,
+                expr=expr,
+            )
+            search_requests.append(request)
+        if self.enable_dynamic_field:
+            output_fields = ["*"]
+        else:
+            output_fields = self._remove_forbidden_fields(self.fields[:])
+        col_search_res = await self.aclient.hybrid_search(
+            self.collection_name,
+            reqs=search_requests,
+            ranker=reranker,
+            limit=k,
+            output_fields=output_fields,
+            timeout=self.timeout or timeout,
+            **kwargs,
+        )
+        return col_search_res
+
+    async def asimilarity_search(
+            self,
+            query: str,
+            k: int = 4,
+            param: Optional[dict | list[dict]] = None,
+            expr: Optional[str] = None,
+            timeout: Optional[float] = None,
+            **kwargs: Any,
+    ) -> List[Document]:
+        """Perform an async similarity search against the query string.
+
+        Args:
+            query (str): The text to search.
+            k (int, optional): How many results to return. Defaults to 4.
+            param (dict | list[dict], optional): The search params for the index type.
+                Defaults to None.
+            expr (str, optional): Filtering expression. Defaults to None.
+            timeout (int, optional): How long to wait before timeout error.
+                Defaults to None.
+            kwargs: Collection.search() keyword arguments.
+
+        Returns:
+            List[Document]: Document results for search.
+        """
+        if self.col is None:
+            logger.debug("No existing collection to search.")
+            return []
+        timeout = self.timeout or timeout
+        res = await self.asimilarity_search_with_score(
+            query=query, k=k, param=param, expr=expr, timeout=timeout, **kwargs
+        )
+        return [doc for doc, _ in res]
+
+    async def asimilarity_search_by_vector(
+            self,
+            embedding: List[float],
+            k: int = 4,
+            param: Optional[dict] = None,
+            expr: Optional[str] = None,
+            timeout: Optional[float] = None,
+            **kwargs: Any,
+    ) -> List[Document]:
+        """Perform an async similarity search against the query vector.
+
+        Args:
+            embedding (List[float]): The embedding vector to search.
+            k (int, optional): How many results to return. Defaults to 4.
+            param (dict, optional): The search params for the index type.
+                Defaults to None.
+            expr (str, optional): Filtering expression. Defaults to None.
+            timeout (int, optional): How long to wait before timeout error.
+                Defaults to None.
+            kwargs: Collection.search() keyword arguments.
+
+        Returns:
+            List[Document]: Document results for search.
+        """
+        if self.col is None:
+            logger.debug("No existing collection to search.")
+            return []
+        timeout = self.timeout or timeout
+        res = await self.asimilarity_search_with_score_by_vector(
+            embedding=embedding, k=k, param=param, expr=expr, timeout=timeout, **kwargs
+        )
+        return [doc for doc, _ in res]
+
+    async def asimilarity_search_with_score(
+            self,
+            query: str,
+            k: int = 4,
+            param: Optional[dict | list[dict]] = None,
+            expr: Optional[str] = None,
+            timeout: Optional[float] = None,
+            **kwargs: Any,
+    ) -> List[Tuple[Document, float]]:
+        """Perform an async search on a query string and return results with score.
+
+        For more information about the search parameters, take a look at the pymilvus
+        documentation found here:
+        https://milvus.io/api-reference/pymilvus/v2.5.x/ORM/Collection/search.md
+
+        Args:
+            query (str): The text being searched.
+            k (int, optional): The amount of results to return. Defaults to 4.
+            param (dict | list[dict], optional): The search params for the specified
+            index. Defaults to None.
+            expr (str, optional): Filtering expression. Defaults to None.
+            timeout (float, optional): How long to wait before timeout error.
+                Defaults to None.
+            kwargs: Collection.search() or hybrid_search() keyword arguments.
+
+        Returns:
+            List[Tuple[Document, float]]: List of result doc and score.
+        """
+        if self.col is None:
+            logger.debug("No existing collection to search.")
+            return []
+
+        if self._is_multi_vector:
+            col_search_res = await self._acollection_hybrid_search(
+                query=query, k=k, param=param, expr=expr, timeout=timeout, **kwargs
+            )
+
+        else:
+            assert len(self._as_list(param)) <= 1, (
+                "When there is only one vector field, you can not provide multiple "
+                "search param dicts."
+            )
+            param = cast(Optional[dict], self._from_list(param))
+            if (
+                    len(self._as_list(self.embedding_func)) == 1  # type: ignore[arg-type]
+                    and len(self._as_list(self.builtin_func)) == 0
+            ):
+                embedding = await self._as_list(self.embedding_func)[0].aembed_query(  # type: ignore
+                    query
+                )
+                col_search_res = await self._acollection_search(
+                    embedding_or_text=embedding,
+                    k=k,
+                    param=param,
+                    expr=expr,
+                    timeout=timeout,
+                    **kwargs,
+                )
+            elif (
+                    len(self._as_list(self.embedding_func)) == 0  # type: ignore[arg-type]
+                    and len(self._as_list(self.builtin_func)) == 1
+            ):
+                col_search_res = await self._acollection_search(
+                    embedding_or_text=query,
+                    k=k,
+                    param=param,
+                    expr=expr,
+                    timeout=timeout,
+                    **kwargs,
+                )
+            else:
+                raise RuntimeError(
+                    "Check either it's multi vectors or single vector with "
+                    "only one embedding/builtin function."
+                )
+
+        return self._parse_documents_from_search_results(col_search_res)
+
+    async def asimilarity_search_with_score_by_vector(
+            self,
+            embedding: List[float] | Dict[int, float],
+            k: int = 4,
+            param: Optional[dict] = None,
+            expr: Optional[str] = None,
+            timeout: Optional[float] = None,
+            **kwargs: Any,
+    ) -> List[Tuple[Document, float]]:
+        """Perform an async search on an embedding and return results with score.
+
+        For more information about the search parameters, take a look at the pymilvus
+        documentation found here:
+        https://milvus.io/api-reference/pymilvus/v2.5.x/ORM/Collection/search.md
+
+        Args:
+            embedding (List[float] | Dict[int, float]): The embedding vector being
+                searched.
+            k (int, optional): The amount of results to return. Defaults to 4.
+            param (dict): The search params for the specified index.
+                Defaults to None.
+            expr (str, optional): Filtering expression. Defaults to None.
+            timeout (float, optional): How long to wait before timeout error.
+                Defaults to None.
+            kwargs: Collection.search() keyword arguments.
+
+        Returns:
+            List[Tuple[Document, float]]: Result doc and score.
+        """
+        col_search_res = await self._acollection_search(
+            embedding_or_text=embedding,
+            k=k,
+            param=param,
+            expr=expr,
+            timeout=timeout,
+            **kwargs,
+        )
+        return self._parse_documents_from_search_results(col_search_res)
+
+    async def amax_marginal_relevance_search(
+            self,
+            query: str,
+            k: int = 4,
+            fetch_k: int = 20,
+            lambda_mult: float = 0.5,
+            param: Optional[dict] = None,
+            expr: Optional[str] = None,
+            timeout: Optional[float] = None,
+            **kwargs: Any,
+    ) -> List[Document]:
+        """Perform an async search and return results that are reordered by MMR.
+
+        Args:
+            query (str): The text being searched.
+            k (int, optional): How many results to give. Defaults to 4.
+            fetch_k (int, optional): Total results to select k from.
+                Defaults to 20.
+            lambda_mult: Number between 0 and 1 that determines the degree
+                        of diversity among the results with 0 corresponding
+                        to maximum diversity and 1 to minimum diversity.
+                        Defaults to 0.5
+            param (dict, optional): The search params for the specified index.
+                Defaults to None.
+            expr (str, optional): Filtering expression. Defaults to None.
+            timeout (float, optional): How long to wait before timeout error.
+                Defaults to None.
+            kwargs: Collection.search() keyword arguments.
+
+
+        Returns:
+            List[Document]: Document results for search.
+        """
+        if self.col is None:
+            logger.debug("No existing collection to search.")
+            return []
+
+        assert (
+                len(self._as_list(self.embedding_func)) == 1  # type: ignore[arg-type]
+        ), "You must set only one embedding function for MMR search."
+        if len(self._vector_fields_from_function) > 0:
+            logger.warning(
+                "MMR search will only use the embedding function, "
+                "without the built-in functions."
+            )
+
+        embedding = await self._as_list(self.embedding_func)[0].aembed_query(query)  # type: ignore
+        timeout = self.timeout or timeout
+        return await self.amax_marginal_relevance_search_by_vector(
+            embedding=embedding,
+            k=k,
+            fetch_k=fetch_k,
+            lambda_mult=lambda_mult,
+            param=param,
+            expr=expr,
+            timeout=timeout,
+            **kwargs,
+        )
+
+    async def amax_marginal_relevance_search_by_vector(
+            self,
+            embedding: list[float] | dict[int, float],
+            k: int = 4,
+            fetch_k: int = 20,
+            lambda_mult: float = 0.5,
+            param: Optional[dict] = None,
+            expr: Optional[str] = None,
+            timeout: Optional[float] = None,
+            **kwargs: Any,
+    ) -> List[Document]:
+        """Perform an async search and return results that are reordered by MMR.
+
+        Args:
+            embedding (list[float] | dict[int, float]): The embedding vector being
+                searched.
+            k (int, optional): How many results to give. Defaults to 4.
+            fetch_k (int, optional): Total results to select k from.
+                Defaults to 20.
+            lambda_mult: Number between 0 and 1 that determines the degree
+                        of diversity among the results with 0 corresponding
+                        to maximum diversity and 1 to minimum diversity.
+                        Defaults to 0.5
+            param (dict, optional): The search params for the specified index.
+                Defaults to None.
+            expr (str, optional): Filtering expression. Defaults to None.
+            timeout (float, optional): How long to wait before timeout error.
+                Defaults to None.
+            kwargs: Collection.search() keyword arguments.
+
+        Returns:
+            List[Document]: Document results for search.
+        """
+        col_search_res = await self._acollection_search(
+            embedding_or_text=embedding,
+            k=fetch_k,
+            param=param,
+            expr=expr,
+            timeout=timeout,
+            **kwargs,
+        )
+        if col_search_res is None:
+            return []
+        ids = []
+        documents = []
+        scores = []
+        for result in col_search_res[0]:
+            doc = self._parse_document(result["entity"])
+            documents.append(doc)
+            scores.append(result["distance"])
+            ids.append(result.get(self._primary_field, "id"))
+
+        vectors = await self.aclient.query(
+            self.collection_name,
+            filter=f"{self._primary_field} in {ids}",
+            output_fields=[self._primary_field, self._vector_field],
+            timeout=timeout,
+        )
+        # Reorganize the results from query to match search order.
+        vectors = {x[self._primary_field]: x[self._vector_field] for x in vectors}
+
+        ordered_result_embeddings = [vectors[x] for x in ids]
+
+        # Get the new order of results.
+        new_ordering = maximal_marginal_relevance(
+            np.array(embedding), ordered_result_embeddings, k=k, lambda_mult=lambda_mult
+        )
+
+        # Reorder the values and return.
+        ret = []
+        for x in new_ordering:
+            # Function can return -1 index
+            if x == -1:
+                break
+            else:
+                ret.append(documents[x])
+        return ret
+
+    async def adelete(
+            self, ids: Optional[List[str]] = None, expr: Optional[str] = None, **kwargs: Any
+    ) -> Optional[bool]:
+        """Async delete by vector ID or boolean expression.
+        Refer to [Milvus documentation](https://milvus.io/docs/delete_data.md)
+        for notes and examples of expressions.
+
+        Args:
+            ids: List of ids to delete.
+            expr: Boolean expression that specifies the entities to delete.
+            kwargs: Other parameters in Milvus delete api.
+
+        Returns:
+            Optional[bool]: True if deletion is successful,
+            False otherwise.
+        """
+        if isinstance(ids, list) and len(ids) > 0:
+            if expr is not None:
+                logger.warning(
+                    "Both ids and expr are provided. " "Ignore expr and delete by ids."
+                )
+            expr = f"{self._primary_field} in {ids}"
+        else:
+            assert isinstance(
+                expr, str
+            ), "Either ids list or expr string must be provided."
+        try:
+            await self.aclient.delete(self.collection_name, filter=expr, **kwargs)
+            return True
+        except MilvusException as e:
+            logger.error(
+                "Failed to delete entities: %s error: %s", self.collection_name, e
+            )
+            return False
+
+    @classmethod
+    async def afrom_texts(
+            cls,
+            texts: List[str],
+            embedding: Optional[Union[EmbeddingType, List[EmbeddingType]]],
+            metadatas: Optional[List[dict]] = None,
+            collection_name: str = "LangChainCollection",
+            connection_args: Optional[Dict[str, Any]] = None,
+            consistency_level: str = "Session",
+            index_params: Optional[Union[dict, List[dict]]] = None,
+            search_params: Optional[Union[dict, List[dict]]] = None,
+            drop_old: bool = False,
+            *,
+            ids: Optional[List[str]] = None,
+            auto_id: bool = False,
+            builtin_function: Optional[
+                Union[BaseMilvusBuiltInFunction, List[BaseMilvusBuiltInFunction]]
+            ] = None,
+            **kwargs: Any,
+    ) -> CustomMilvus:
+        """Create a Milvus collection, indexes it with HNSW, and insert data
+        asynchronously.
+
+        Args:
+            texts (List[str]): Text data.
+            embedding (Optional[Union[Embeddings, BaseSparseEmbedding]]): Embedding
+                function.
+            metadatas (Optional[List[dict]]): Metadata for each text if it exists.
+                Defaults to None.
+            collection_name (str, optional): Collection name to use. Defaults to
+                "LangChainCollection".
+            connection_args (dict[str, Any], optional): Connection args to use. Defaults
+                to DEFAULT_MILVUS_CONNECTION.
+            consistency_level (str, optional): Which consistency level to use. Defaults
+                to "Session".
+            index_params (Optional[dict], optional): Which index_params to use. Defaults
+                to None.
+            search_params (Optional[dict], optional): Which search params to use.
+                Defaults to None.
+            drop_old (Optional[bool], optional): Whether to drop the collection with
+                that name if it exists. Defaults to False.
+            ids (Optional[List[str]]): List of text ids. Defaults to None.
+            auto_id (bool): Whether to enable auto id for primary key. Defaults to
+                False. If False, you need to provide text ids (string less than 65535
+                bytes). If True, Milvus will generate unique integers as primary keys.
+            builtin_function (Optional[Union[BaseMilvusBuiltInFunction,
+                List[BaseMilvusBuiltInFunction]]]):
+                Built-in function to use. Defaults to None.
+            **kwargs: Other parameters in Milvus Collection.
+        Returns:
+            Milvus: Milvus Vector Store
+        """
+        if isinstance(ids, list) and len(ids) > 0:
+            if auto_id:
+                logger.warning(
+                    "Both ids and auto_id are provided. " "Ignore auto_id and use ids."
+                )
+            auto_id = False
+        else:
+            auto_id = True
+
+        vector_db = cls(
+            embedding_function=embedding,
+            collection_name=collection_name,
+            connection_args=connection_args,
+            consistency_level=consistency_level,
+            index_params=index_params,
+            search_params=search_params,
+            drop_old=drop_old,
+            auto_id=auto_id,
+            builtin_function=builtin_function,
+            **kwargs,
+        )
+        await vector_db.aadd_texts(texts=texts, metadatas=metadatas, ids=ids)
+        return vector_db
+
+    async def aadd_documents(
+            self, documents: List[Document], **kwargs: Any
+    ) -> List[str]:
+        """Run more documents through the embeddings and add to the vectorstore
+        asynchronously.
+
+        Args:
+            documents: Documents to add to the vectorstore.
+
+        Returns:
+            List of IDs of the added texts.
+        """
+        texts = [doc.page_content for doc in documents]
+        metadatas = [doc.metadata for doc in documents]
+        return await self.aadd_texts(texts, metadatas, **kwargs)
+
+    async def aget_pks(self, expr: str, **kwargs: Any) -> List[int] | None:
+        """Async get primary keys with expression
+
+        Args:
+            expr: Expression - E.g: "id in [1, 2]", or "title LIKE 'Abc%'"
+
+        Returns:
+            List[int]: List of IDs (Primary Keys)
+        """
+
+        if self.col is None:
+            logger.debug("No existing collection to get pk.")
+            return None
+
+        try:
+            query_result = await self.aclient.query(
+                self.collection_name,
+                filter=expr,
+                output_fields=[self._primary_field],
+            )
+        except MilvusException as exc:
+            logger.error("Failed to get ids: %s error: %s", self.collection_name, exc)
+            raise exc
+        pks = [item.get(self._primary_field) for item in query_result]
+        return pks
+
+    async def aupsert(
+            self,
+            ids: Optional[List[str]] = None,
+            documents: List[Document] | None = None,
+            batch_size: int = 1000,
+            timeout: Optional[float] = None,
+            **kwargs: Any,
+    ) -> None:
+        """Update/Insert documents to the vectorstore asynchronously.
+
+        Args:
+            ids: IDs to update - Let's call aget_pks to get ids with expression
+            documents (List[Document]): Documents to add to the vectorstore.
+            batch_size (int, optional): Batch size to use for upsert.
+                Defaults to 1000.
+            timeout (Optional[float]): Timeout for each batch upsert. Defaults
+                to None.
+            **kwargs: Other parameters in Milvus upsert api.
+        """
+
+        if documents is None or len(documents) == 0:
+            logger.debug("No documents to upsert.")
+            return
+
+        if not ids:
+            await self.aadd_documents(documents=documents, **kwargs)
+            return
+
+        assert len(set(ids)) == len(
+            documents
+        ), "Different lengths of documents and unique ids are provided."
+
+        embeddings_functions: List[EmbeddingType] = self._as_list(self.embedding_func)
+        embeddings: List = []
+        texts = [doc.page_content for doc in documents]
+        metadatas = [doc.metadata for doc in documents]
+        for embedding_func in embeddings_functions:
+            try:
+                embeddings.append(await embedding_func.aembed_documents(texts))
+            except NotImplementedError:
+                embeddings.append([await embedding_func.aembed_query(x) for x in texts])
+
+        upsert_list = self._prepare_insert_list(
+            texts=texts,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            ids=ids,
+            force_ids=True,
+        )
+
+        # Total upsert count
+        total_count = len(upsert_list)
+
+        assert isinstance(self.col, Collection)
+        for i in range(0, total_count, batch_size):
+            # Grab end index
+            end = min(i + batch_size, total_count)
+            batch_upsert_list = upsert_list[i:end]
+            # Upsert into the collection.
+            try:
+                timeout = self.timeout or timeout
+                await self.aclient.upsert(
+                    self.collection_name,
+                    batch_upsert_list,
+                    timeout=timeout,
+                    **kwargs,
+                )
+            except MilvusException as e:
+                self._handle_batch_operation_exception(
+                    e, batch_upsert_list, i, total_count, "upsert"
+                )
+        return
+
+    async def asearch_by_metadata(
+            self, expr: str, fields: Optional[List[str]] = None, limit: int = 10
+    ) -> List[Document]:
+        """
+        Async searches the Milvus vector store based on metadata conditions.
+
+        This function performs a metadata-based query using an expression
+        that filters stored documents without vector similarity.
+
+        Args:
+            expr (str): A filtering expression (e.g., `"city == 'Seoul'"`).
+            fields (Optional[List[str]]): List of fields to retrieve.
+                                          If None, retrieves all available fields.
+            limit (int): Maximum number of results to return.
+
+        Returns:
+            List[Document]: List of documents matching the metadata filter.
+        """
+        from pymilvus import MilvusException
+
+        if self.col is None:
+            logger.debug("No existing collection to search.")
+            return []
+
+        # Default to retrieving all fields if none are provided
+        if fields is None:
+            fields = self.fields
+
+        try:
+            results = await self.aclient.query(
+                self.collection_name,
+                filter=expr,
+                output_fields=fields,
+                limit=limit,
+            )
             return [
                 Document(page_content="", metadata=result)
                 for result in results

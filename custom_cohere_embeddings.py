@@ -4,7 +4,7 @@ import typing
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import cohere
-from cohere import EmbedInput, TextEmbedContent, ImageUrlEmbedContent, EmbedImageUrl
+from cohere import EmbedInput, ImageUrlEmbedContent, EmbedImageUrl, TextEmbedContent
 from langchain_cohere.utils import _create_retry_decorator
 from langchain_core.embeddings import Embeddings
 from langchain_core.utils import get_from_dict_or_env, secret_from_env
@@ -139,6 +139,7 @@ class CustomCohereEmbeddings(BaseModel, Embeddings):
         retry_decorator = _create_retry_decorator(self.max_retries)
 
         embed_inputs = []
+
         for raw_input in kwargs.get("texts"):
             if is_base64_data_uri(raw_input):
                 embed_input = EmbedInput(content=[ImageUrlEmbedContent(image_url=EmbedImageUrl(url=raw_input))])
@@ -161,6 +162,7 @@ class CustomCohereEmbeddings(BaseModel, Embeddings):
         retry_decorator = _create_retry_decorator(self.max_retries)
 
         embed_inputs = []
+
         for raw_input in kwargs.get("texts"):
             if is_base64_data_uri(raw_input):
                 embed_input = EmbedInput(content=[ImageUrlEmbedContent(image_url=EmbedImageUrl(url=raw_input))])
