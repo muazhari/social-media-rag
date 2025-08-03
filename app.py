@@ -4,29 +4,31 @@ import copy
 import os
 import pickle
 import uuid
+from asyncio import AbstractEventLoop
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import nest_asyncio
 import streamlit as st
 from langchain.storage import LocalFileStore
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, BaseMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph
-from nio import AsyncClient, RoomMessageText, RoomMessageMedia, SyncError, RoomMessagesError, \
+from nio import AsyncClient, RoomMessageText, RoomMessageMedia, RoomMessagesError, \
     AsyncClientConfig, RoomEncryptedMedia, DownloadError, Event
 from nio.crypto import decrypt_attachment
 from pydantic import BaseModel
 
-from custom_cohere_embeddings import CustomCohereEmbeddings
-from custom_milvus import CustomMilvus
+from customs.cohere.cohere_embeddings import CustomCohereEmbeddings
+from customs.milvus.milvus import CustomMilvus
 
 if "event_loop" not in st.session_state:
-    loop = asyncio.new_event_loop()
-    st.session_state["event_loop"] = loop
+    st.session_state["event_loop"] = asyncio.new_event_loop()
 
-loop = st.session_state["event_loop"]
+loop: AbstractEventLoop = st.session_state["event_loop"]
 asyncio.set_event_loop(loop)
+nest_asyncio.apply()
 
 store_path = Path("stores")
 store_path.mkdir(exist_ok=True)
@@ -139,10 +141,6 @@ async def make_matrix_client():
         infile=str(keys_file_path),
         passphrase=matrix_keys_passphrase,
     )
-
-    sync_response = await matrix_client.sync(full_state=True, timeout=30000)
-    if isinstance(sync_response, SyncError):
-        raise Exception(f"Sync failed: {sync_response}")
 
     return matrix_client
 
@@ -418,6 +416,7 @@ if st.sidebar.button("Sync", use_container_width=True):
 if st.sidebar.button("Reset", use_container_width=True):
     if vector_store.col:
         vector_store.col.drop()
+
     file_store.mdelete(keys=list(file_store.yield_keys()))
 
     for key in st.session_state.keys():

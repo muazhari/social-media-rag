@@ -1993,7 +1993,7 @@ class CustomMilvus(VectorStore):
                 Union[BaseMilvusBuiltInFunction, List[BaseMilvusBuiltInFunction]]
             ] = None,
             **kwargs: Any,
-    ) -> CustomMilvus:
+    ) -> Milvus:
         """Create a Milvus collection, indexes it with HNSW, and insert data.
 
         Args:
@@ -2986,7 +2986,7 @@ class CustomMilvus(VectorStore):
                 Union[BaseMilvusBuiltInFunction, List[BaseMilvusBuiltInFunction]]
             ] = None,
             **kwargs: Any,
-    ) -> CustomMilvus:
+    ) -> Milvus:
         """Create a Milvus collection, indexes it with HNSW, and insert data
         asynchronously.
 

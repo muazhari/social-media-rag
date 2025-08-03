@@ -5,11 +5,12 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import cohere
 from cohere import EmbedInput, ImageUrlEmbedContent, EmbedImageUrl, TextEmbedContent
-from langchain_cohere.utils import _create_retry_decorator
 from langchain_core.embeddings import Embeddings
 from langchain_core.utils import get_from_dict_or_env, secret_from_env
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from typing_extensions import Self
+
+from .utils import _create_retry_decorator
 
 
 def is_base64_data_uri(s: str) -> bool:
@@ -136,8 +137,6 @@ class CustomCohereEmbeddings(BaseModel, Embeddings):
 
     def embed_with_retry(self, **kwargs: Any) -> Any:
         """Use tenacity to retry the embed call."""
-        retry_decorator = _create_retry_decorator(self.max_retries)
-
         embed_inputs = []
 
         for raw_input in kwargs.get("texts"):
@@ -150,6 +149,8 @@ class CustomCohereEmbeddings(BaseModel, Embeddings):
 
         kwargs["inputs"] = embed_inputs
         del kwargs["texts"]
+
+        retry_decorator = _create_retry_decorator(self.max_retries)
 
         @retry_decorator
         def _embed_with_retry(**kwargs: Any) -> Any:
@@ -159,8 +160,6 @@ class CustomCohereEmbeddings(BaseModel, Embeddings):
 
     def aembed_with_retry(self, **kwargs: Any) -> Any:
         """Use tenacity to retry the embed call."""
-        retry_decorator = _create_retry_decorator(self.max_retries)
-
         embed_inputs = []
 
         for raw_input in kwargs.get("texts"):
@@ -173,6 +172,8 @@ class CustomCohereEmbeddings(BaseModel, Embeddings):
 
         kwargs["inputs"] = embed_inputs
         del kwargs["texts"]
+
+        retry_decorator = _create_retry_decorator(self.max_retries)
 
         @retry_decorator
         async def _embed_with_retry(**kwargs: Any) -> Any:
