@@ -2,3 +2,4 @@
 .venv
 stores
 **/__pycache__
+.idea

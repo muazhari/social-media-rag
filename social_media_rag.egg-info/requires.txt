@@ -11,3 +11,7 @@ langchain-cohere
 langchain-google-genai
 pymilvus
 nest_asyncio
+aioboto3
+dependency-injector
+sqlmodel
+asyncpg

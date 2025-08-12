@@ -16,3 +16,7 @@ Requires-Dist: langchain-cohere
 Requires-Dist: langchain-google-genai
 Requires-Dist: pymilvus
 Requires-Dist: nest_asyncio
+Requires-Dist: aioboto3
+Requires-Dist: dependency-injector
+Requires-Dist: sqlmodel
+Requires-Dist: asyncpg

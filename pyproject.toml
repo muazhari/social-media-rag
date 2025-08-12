@@ -17,6 +17,10 @@ dependencies = [
     "langchain-google-genai",
     "pymilvus",
     "nest_asyncio",
+    "aioboto3",
+    "dependency-injector",
+    "sqlmodel",
+    "asyncpg",
 ]
 
 [tool.setuptools.packages.find]
