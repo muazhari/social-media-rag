@@ -10,8 +10,8 @@ from nio import RoomMessageText, RoomMessageMedia, RoomEncryptedMedia, DownloadE
     RoomMessagesError
 from nio.crypto import decrypt_attachment
 
-from internals.customs.milvus.milvus import CustomMilvus
 from internals.datastores.file_store import FileStore
+from internals.datastores.vector_store import VectorStore
 from internals.models.config import SessionConfig
 from internals.models.document import DocumentRecord
 from internals.repositories.document_repository import DocumentRepository
@@ -22,7 +22,7 @@ class SyncUseCase:
             self,
             document_repository: DocumentRepository,
             file_store: FileStore,
-            vector_store: CustomMilvus,
+            vector_store: VectorStore,
             matrix_client: AsyncClient,
             session_config: Dict
     ):
@@ -126,7 +126,7 @@ class SyncUseCase:
 
         if len(documents) > 0:
             await self.file_store.amset(list(zip(document_ids, bytes_documents)))
-            if self.vector_store.col:
+            if self.vector_store.client.col:
                 await self.vector_store.adelete(ids=document_ids)
             await self.vector_store.aadd_documents(ids=document_ids, documents=vector_documents)
 

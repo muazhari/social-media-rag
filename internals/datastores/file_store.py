@@ -72,8 +72,3 @@ class FileStore:
                 path = f"{self.session_config.session_id}/{key}"
                 tasks.append(client.delete_object(Bucket=self.app_config.s3_bucket, Key=path))
             await asyncio.gather(*tasks)
-
-            prefix = f"{self.session_config.session_id}/"
-            response = await client.list_objects_v2(Bucket=self.app_config.s3_bucket, Prefix=prefix)
-            if response.get("KeyCount", 0) == 0:
-                await client.delete_object(Bucket=self.app_config.s3_bucket, Key=prefix)
