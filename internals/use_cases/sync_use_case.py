@@ -13,7 +13,7 @@ from nio.crypto import decrypt_attachment
 from internals.datastores.file_store import FileStore
 from internals.datastores.vector_store import VectorStore
 from internals.models.config import SessionConfig
-from internals.models.document import DocumentRecord
+from internals.models.entity import DocumentRecord
 from internals.repositories.document_repository import DocumentRepository
 
 
@@ -33,36 +33,41 @@ class SyncUseCase:
         self.session_config = SessionConfig(**session_config)
 
     async def process_event(self, event: Event) -> List[Document]:
+        document_id = str(uuid.uuid5(uuid.NAMESPACE_OID, event.event_id))
+
         if isinstance(event, RoomMessageText):
-            doc = Document(
-                id=str(uuid.uuid5(uuid.NAMESPACE_OID, event.event_id)),
+            document = Document(
+                id=document_id,
                 page_content=event.body,
                 metadata={
-                    "exclusion": {"event_type": "text", "event_source": event.source}
+                    "exclusion": {
+                        "event_type": "text",
+                        "event_source": event.source
+                    }
                 }
             )
-            return [doc]
+            return [document]
         elif isinstance(event, RoomMessageMedia):
             mime = event.source["content"]["info"]["mimetype"]
             uri = await self.matrix_client.mxc_to_http(event.url)
             download_response = await self.matrix_client.download(event.url)
             if isinstance(download_response, DownloadError):
                 raise Exception(f"Download failed: {download_response}")
+            base64_data = base64.b64encode(download_response.body).decode('utf-8')
+            base64_uri = f"data:{mime};base64,{base64_data}"
             if mime.startswith("image/"):
-                b64 = f"data:{mime};base64,{base64.b64encode(download_response.body).decode()}"
-                doc = Document(
-                    id=str(uuid.uuid5(uuid.NAMESPACE_OID, event.event_id)),
-                    page_content=b64,
+                document = Document(
+                    id=document_id,
+                    page_content=base64_uri,
                     metadata={
                         "exclusion": {
                             "event_type": "media",
                             "uri": uri,
-                            "data": download_response.body,
                             "event_source": event.source
                         }
                     }
                 )
-                return [doc]
+                return [document]
             return []
         elif isinstance(event, RoomEncryptedMedia):
             mime = event.source["content"]["info"]["mimetype"]
@@ -76,21 +81,21 @@ class SyncUseCase:
                 hash=event.hashes["sha256"],
                 iv=event.iv
             )
+            base64_data = base64.b64encode(data).decode('utf-8')
+            base64_uri = f"data:{mime};base64,{base64_data}"
             if mime.startswith("image/"):
-                b64 = f"data:{mime};base64,{base64.b64encode(data).decode()}"
-                doc = Document(
-                    id=str(uuid.uuid5(uuid.NAMESPACE_OID, event.event_id)),
-                    page_content=b64,
+                document = Document(
+                    id=document_id,
+                    page_content=base64_uri,
                     metadata={
                         "exclusion": {
                             "event_type": "encrypted_media",
                             "uri": uri,
-                            "data": data,
                             "event_source": event.source
                         }
                     }
                 )
-                return [doc]
+                return [document]
             return []
         else:
             return []
@@ -107,7 +112,6 @@ class SyncUseCase:
         vector_documents = []
 
         for document in documents:
-            # Persist file blob and vector in parallel
             bytes_document = pickle.dumps(document)
             vector_document = copy.deepcopy(document)
             del vector_document.metadata["exclusion"]
@@ -151,7 +155,6 @@ class SyncUseCase:
 
     async def execute(self, progress_callback: Callable[[str, str, float], None]):
         try:
-            # Fetch messages concurrently
             room_ids = self.session_config.matrix_room_ids.split(",")
             fetch_tasks = []
             for room_id in room_ids:

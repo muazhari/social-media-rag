@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import io
 import os
 import uuid
@@ -11,6 +10,7 @@ from langchain_core.documents import Document
 
 from internals.containers.app_container import AppContainer
 from internals.models.config import AppConfig, SessionConfig
+from internals.models.value_object import QueryResult
 
 if "event_loop" not in st.session_state:
     st.session_state["event_loop"] = asyncio.new_event_loop()
@@ -28,7 +28,6 @@ async def main():
 
     app_config_toggle = st.sidebar.toggle(
         "Use server environment variables.",
-        key="app_config_toggle",
         value=True
     )
 
@@ -75,12 +74,13 @@ async def main():
         db_url = st.sidebar.text_input(
             "Database URL",
             key="DB_URL",
-            value=st.session_state.get("DB_URL")
+            value=st.session_state.get("DB_URL"),
+            placeholder="postgresql+asyncpg://user:password@host:port/db"
         )
         s3_bucket = st.sidebar.text_input(
             "S3 Bucket",
-            key="SUPABASE_S3_BUCKET",
-            value=st.session_state.get("S3_BUCKET")
+            key="S3_BUCKET",
+            value=st.session_state.get("S3_BUCKET", "social_media_rag")
         )
         s3_region_name = st.sidebar.text_input(
             "S3 Region Name",
@@ -109,7 +109,6 @@ async def main():
 
     session_config_toggle = st.sidebar.toggle(
         "Use server environment variables.",
-        key="session_config_toggle",
         value=False
     )
 
@@ -271,41 +270,43 @@ async def main():
             vector_store.client.col.drop()
         await file_store.mdelete([key async for key in file_store.yield_keys()])
         st.session_state.clear()
-        st.success("State reset.")
+        st.success("Reset completed.")
 
     # Query
     query = st.text_area("Ask a query:")
     if st.button("Submit") and query:
         result = await query_use_case.execute(query)
-        st.session_state["qna_result"] = result
+        st.session_state["query_result"] = result
 
     @st.dialog(title="Citation Details", width="large")
     def citation_details(document: Document):
         st.write(document.model_dump())
 
     # Display results
-    if "qna_result" in st.session_state:
-        res = st.session_state["qna_result"]
+    if "query_result" in st.session_state:
+        query_result: QueryResult = st.session_state["query_result"]
+
         st.markdown("**Response:**")
-        st.write(res["response"].content)
+        st.write(query_result.response.content)
+
         st.markdown("**Citations:**")
-        for index, document in enumerate(res["documents"], 1):
+        for index, document in enumerate(query_result.documents, 1):
             event_type = document.metadata["exclusion"]["event_type"]
+
             if st.button(label=f"[{index}] {document.metadata['retrieval_score']}"):
                 citation_details(document)
-            if event_type == "text":
+
+            if event_type in ["text"]:
                 st.text(document.page_content)
-            elif event_type in "media":
-                uri = document.metadata["exclusion"]["uri"]
-                st.image(uri)
-            elif event_type in "encrypted_media":
-                data = document.metadata["exclusion"]["data"]
-                b64_data = base64.b64encode(data).decode("utf-8")
+            elif event_type in ["media", "encrypted_media"]:
                 mime_type = document.metadata["exclusion"]["event_source"]["content"]["info"]["mimetype"]
-                uri = f"data:{mime_type};base64,{b64_data}"
-                st.image(uri)
+                if mime_type.startswith("image/"):
+                    uri = document.page_content
+                    st.image(uri)
+                else:
+                    st.warning(f"Unsupported media type: {mime_type}")
             else:
-                raise Exception(f"Unsupported mime type: {document}")
+                st.warning(f"Unsupported event type: {event_type}")
 
 
 if __name__ == "__main__":

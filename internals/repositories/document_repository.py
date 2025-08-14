@@ -3,7 +3,7 @@ from typing import List
 from sqlmodel import select, delete
 
 from internals.datastores.sql_store import SqlStore
-from internals.models.document import DocumentRecord
+from internals.models.entity import DocumentRecord
 
 
 class DocumentRepository:
